@@ -10,9 +10,12 @@ Reads DuckLake metadata directly from SQLite (no DuckDB runtime dependency) and 
 
 ```bash
 pip install ducklake-polars
+
+# With PostgreSQL support
+pip install ducklake-polars[postgres]
 ```
 
-The only runtime dependency is `polars >= 1.0`. The catalog is read via Python's built-in `sqlite3` module.
+The only runtime dependency is `polars >= 1.0`. SQLite catalogs are read via Python's built-in `sqlite3` module. For PostgreSQL catalogs, install the `postgres` extra which adds `psycopg2`.
 
 ## Quick start
 
@@ -40,6 +43,9 @@ df = read_ducklake("catalog.ducklake", "my_table", schema="analytics")
 
 # Override the data path (useful when catalog has been moved)
 df = read_ducklake("catalog.ducklake", "my_table", data_path="/new/data/location")
+
+# Read from a PostgreSQL-backed catalog
+df = read_ducklake("postgresql://user:pass@localhost/mydb", "my_table")
 ```
 
 ## Features
@@ -51,7 +57,8 @@ df = read_ducklake("catalog.ducklake", "my_table", data_path="/new/data/location
 - **Schema evolution** (add column, drop column) via Polars' `missing_columns` / `extra_columns` options
 - **Inlined data** support for small tables stored directly in the catalog
 - **File pruning** via column-level min/max statistics
-- **No DuckDB runtime dependency** -- metadata is read directly from SQLite
+- **SQLite and PostgreSQL backends** -- reads metadata from either backend transparently
+- **No DuckDB runtime dependency** -- metadata is read directly from SQLite or PostgreSQL
 
 ## Creating a DuckLake catalog
 
@@ -135,13 +142,14 @@ print(df)
 ```
 ducklake-polars
 ├── __init__.py       # Public API: scan_ducklake(), read_ducklake()
-├── _catalog.py       # SQLite metadata reader (snapshots, tables, columns, files)
+├── _backend.py       # Backend adapters (SQLite, PostgreSQL)
+├── _catalog.py       # Metadata reader (snapshots, tables, columns, files)
 ├── _dataset.py       # Polars PythonDatasetProvider implementation
 ├── _schema.py        # DuckLake type string -> Polars type mapping
 └── _stats.py         # Column statistics for file pruning
 ```
 
-The library reads DuckLake metadata tables (`ducklake_snapshot`, `ducklake_table`, `ducklake_column`, `ducklake_data_file`, etc.) directly from the SQLite catalog file using Python's `sqlite3` module. It then constructs a Polars `scan_parquet()` call with the resolved file paths, deletion files, and statistics, letting Polars handle all the actual data reading and query optimization.
+The library reads DuckLake metadata tables (`ducklake_snapshot`, `ducklake_table`, `ducklake_column`, `ducklake_data_file`, etc.) from the catalog database (SQLite or PostgreSQL) through a thin backend adapter layer. It then constructs a Polars `scan_parquet()` call with the resolved file paths, deletion files, and statistics, letting Polars handle all the actual data reading and query optimization.
 
 ## Building from source
 
@@ -159,7 +167,13 @@ This installs the package in editable mode along with dev dependencies (`pytest`
 pytest
 ```
 
-Tests use DuckDB with the DuckLake extension to create SQLite-backed catalogs in temporary directories, then read them back with ducklake-polars to verify correctness. DuckDB is only a test dependency -- it is not required at runtime.
+Tests use DuckDB with the DuckLake extension to create catalogs in temporary directories, then read them back with ducklake-polars to verify correctness. DuckDB is only a test dependency -- it is not required at runtime.
+
+By default tests run against SQLite. To also run against PostgreSQL, set the `DUCKLAKE_PG_DSN` environment variable:
+
+```bash
+DUCKLAKE_PG_DSN="postgresql://user:pass@localhost/testdb" pytest
+```
 
 To run tests in parallel:
 

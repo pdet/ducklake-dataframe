@@ -7,9 +7,9 @@
 ## What this project is
 
 A pure-Python Polars integration for [DuckLake](https://ducklake.select/) catalogs. It reads
-DuckLake metadata directly from SQLite (via Python's stdlib `sqlite3`) and scans the underlying
-Parquet data files through Polars' native Parquet reader. There is **no DuckDB runtime dependency** --
-DuckDB is only used in tests to create catalog fixtures.
+DuckLake metadata from SQLite (via Python's stdlib `sqlite3`) or PostgreSQL (via `psycopg2`) and
+scans the underlying Parquet data files through Polars' native Parquet reader. There is **no DuckDB
+runtime dependency** -- DuckDB is only used in tests to create catalog fixtures.
 
 Public API: `scan_ducklake()` (LazyFrame) and `read_ducklake()` (DataFrame), exported from
 `ducklake_polars/__init__.py`.
@@ -19,7 +19,8 @@ Public API: `scan_ducklake()` (LazyFrame) and `read_ducklake()` (DataFrame), exp
 ```
 src/ducklake_polars/
     __init__.py      Public API: scan_ducklake(), read_ducklake()
-    _catalog.py      SQLite metadata reader (snapshots, tables, columns, files, stats, inlined data)
+    _backend.py      Backend adapters: SQLiteBackend, PostgreSQLBackend, create_backend()
+    _catalog.py      Metadata reader (snapshots, tables, columns, files, stats, inlined data)
     _dataset.py      Polars PythonDatasetProvider implementation (DuckLakeDataset)
     _schema.py       DuckLake type string -> Polars DataType mapping
     _stats.py        Column statistics builder for file pruning
@@ -113,11 +114,25 @@ Test fixtures are in `tests/conftest.py`:
 - `ducklake_catalog` -- data inlining **disabled** (forces Parquet files). Used by most tests.
 - `ducklake_catalog_inline` -- data inlining **enabled**. Used by inlined data tests.
 
-Both fixtures use `ATTACH 'ducklake:sqlite:{path}' AS ducklake (DATA_PATH '{data_path}' ...)`.
-The caller **must** call `cat.close()` before reading with ducklake-polars to release the
-SQLite file lock.
+Both fixtures are **parametrized over available backends**: always SQLite, plus PostgreSQL when
+`DUCKLAKE_PG_DSN` is set. Test IDs include the backend suffix (e.g. `test_basic_read[sqlite]`,
+`test_basic_read[postgres]`). PostgreSQL tests are marked `@pytest.mark.postgres`.
 
-Current test status: **130 passed, 5 xfailed** (hugeint, uhugeint, interval, map, column rename).
+The `DuckLakeTestCatalog` helper handles both backends:
+- `backend` attribute: `"sqlite"` or `"postgres"`
+- `query_metadata(sql, params)`: queries the underlying metadata database directly (after
+  DuckDB is closed). Handles `?` → `%s` placeholder translation for PostgreSQL.
+- `_cleanup_postgres_tables()`: drops all public tables between tests for isolation.
+
+The caller **must** call `cat.close()` before reading with ducklake-polars to release the
+SQLite file lock. For tests that need direct metadata access after closing, use
+`cat.query_metadata()` instead of opening sqlite3 directly.
+
+Note: PostgreSQL tests should not be run in parallel (`pytest-xdist`) since they share a
+single database.
+
+Current test status (SQLite only): **148 passed, 5 xfailed** (hugeint, uhugeint, interval,
+map, column rename).
 
 ## Known limitations and future work
 
@@ -142,9 +157,11 @@ Current test status: **130 passed, 5 xfailed** (hugeint, uhugeint, interval, map
 
 ## Conventions
 
-- Only runtime dependency is `polars >= 1.0`. No DuckDB, no PyArrow, no other dependencies.
-- All SQL queries use parameterized `?` placeholders for values. Identifiers (table names,
-  column names) use double-quote escaping with embedded quotes doubled (`"` -> `""`).
+- Only runtime dependency is `polars >= 1.0`. PostgreSQL support requires the `postgres` extra
+  (`pip install ducklake-polars[postgres]`). No DuckDB, no PyArrow, no other dependencies.
+- All SQL queries use parameterized `?` placeholders for values (translated to `%s` for PostgreSQL
+  by the `_sql()` helper). Identifiers (table names, column names) use double-quote escaping
+  with embedded quotes doubled (`"` -> `""`).
 - `DuckLakeCatalogReader` supports context manager (`with reader:`) and must be closed
   after use.
 - Error messages include the table name, schema name, and snapshot ID for debuggability.
@@ -158,14 +175,21 @@ Current test status: **130 passed, 5 xfailed** (hugeint, uhugeint, interval, map
 - Accepts `str | Path` for path arguments (uses `os.fspath()`).
 - Uses Polars private internals: `polars._plr.PyLazyFrame`, `polars._utils.wrap.wrap_ldf`.
 
+### `_backend.py`
+- `SQLiteBackend` / `PostgreSQLBackend` -- dataclasses handling connection creation, parameter
+  placeholder style (`?` vs `%s`), and table-not-found error detection.
+- `create_backend(path)` -- auto-detects backend from path/connection string.
+- `psycopg2` is imported lazily only when a PostgreSQL backend is used.
+
 ### `_catalog.py`
-- `DuckLakeCatalogReader` -- opens SQLite in read-only mode (`?mode=ro` URI).
+- `DuckLakeCatalogReader` -- delegates connection to the backend adapter.
+- `_sql()` helper translates `?` placeholders to the backend's style.
 - Key methods: `get_current_snapshot()`, `get_snapshot_at_version()`, `get_snapshot_at_time()`,
   `get_table()`, `get_columns()`, `get_all_columns()`, `get_data_files()`, `get_delete_files()`,
   `get_column_stats()`, `read_inlined_data()`.
 - `resolve_data_file_path()` builds full paths: `data_path / schema_path / table_path / file_path`.
-- `OperationalError` catches in `get_inlined_data_tables` and `read_inlined_data` are narrowed
-  to "no such table" only.
+- `except Exception` + `backend.is_table_not_found()` in `get_inlined_data_tables` and
+  `read_inlined_data` handles both SQLite and PostgreSQL missing-table errors.
 
 ### `_dataset.py`
 - `DuckLakeDataset` -- dataclass implementing PythonDatasetProvider.

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from ducklake_polars._backend import create_backend
 
 import polars as pl
 
@@ -96,8 +97,9 @@ class DuckLakeCatalogReader:
     """
     Reads metadata from a DuckLake catalog database.
 
-    Connects to the DuckLake metadata catalog (a SQLite database file)
-    and provides methods to query tables, columns, files, and statistics.
+    Connects to the DuckLake metadata catalog (a SQLite database file or
+    PostgreSQL database) and provides methods to query tables, columns,
+    files, and statistics.
     """
 
     def __init__(
@@ -106,18 +108,21 @@ class DuckLakeCatalogReader:
         *,
         data_path_override: str | None = None,
     ) -> None:
-        self._metadata_path = os.path.abspath(metadata_path)
+        self._backend = create_backend(metadata_path)
         self._data_path_override = data_path_override
-        self._con: sqlite3.Connection | None = None
+        self._con: Any = None
         self._data_path: str | None = None
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> Any:
         if self._con is None:
-            self._con = sqlite3.connect(
-                f"file:{self._metadata_path}?mode=ro",
-                uri=True,
-            )
+            self._con = self._backend.connect()
         return self._con
+
+    def _sql(self, query: str) -> str:
+        """Translate ``?`` placeholders to the backend's parameter style."""
+        if self._backend.placeholder != "?":
+            return query.replace("?", self._backend.placeholder)
+        return query
 
     def __enter__(self) -> DuckLakeCatalogReader:
         return self
@@ -140,7 +145,7 @@ class DuckLakeCatalogReader:
             else:
                 con = self._connect()
                 row = con.execute(
-                    "SELECT value FROM ducklake_metadata WHERE key = 'data_path'"
+                    self._sql("SELECT value FROM ducklake_metadata WHERE key = 'data_path'")
                 ).fetchone()
                 if row is None:
                     msg = "No data_path found in ducklake_metadata"
@@ -189,11 +194,11 @@ class DuckLakeCatalogReader:
         """Get snapshot info at a specific version."""
         con = self._connect()
         row = con.execute(
-            """
+            self._sql("""
             SELECT snapshot_id, schema_version, next_file_id
             FROM ducklake_snapshot
             WHERE snapshot_id = ?
-            """,
+            """),
             [version],
         ).fetchone()
         if row is None:
@@ -210,13 +215,13 @@ class DuckLakeCatalogReader:
         con = self._connect()
         ts_str = timestamp if isinstance(timestamp, str) else timestamp.isoformat()
         row = con.execute(
-            """
+            self._sql("""
             SELECT snapshot_id, schema_version, next_file_id
             FROM ducklake_snapshot
             WHERE snapshot_time <= ?
             ORDER BY snapshot_id DESC
             LIMIT 1
-            """,
+            """),
             [ts_str],
         ).fetchone()
         if row is None:
@@ -232,7 +237,7 @@ class DuckLakeCatalogReader:
         """Get table info for a given table at a specific snapshot."""
         con = self._connect()
         row = con.execute(
-            """
+            self._sql("""
             SELECT t.table_id, t.table_name, t.schema_id,
                    t.path, t.path_is_relative,
                    s.path, s.path_is_relative
@@ -244,7 +249,7 @@ class DuckLakeCatalogReader:
               AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
               AND ? >= s.begin_snapshot
               AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
-            """,
+            """),
             [table_name, schema_name, snapshot_id, snapshot_id, snapshot_id, snapshot_id],
         ).fetchone()
         if row is None:
@@ -269,7 +274,7 @@ class DuckLakeCatalogReader:
         """Get all column definitions (including nested) for a table at a specific snapshot."""
         con = self._connect()
         rows = con.execute(
-            """
+            self._sql("""
             SELECT column_id, column_name, column_type, column_order,
                    parent_column, nulls_allowed
             FROM ducklake_column
@@ -277,7 +282,7 @@ class DuckLakeCatalogReader:
               AND ? >= begin_snapshot
               AND (? < end_snapshot OR end_snapshot IS NULL)
             ORDER BY column_order
-            """,
+            """),
             [table_id, snapshot_id, snapshot_id],
         ).fetchall()
         return [
@@ -296,7 +301,7 @@ class DuckLakeCatalogReader:
         """Get data files for a table at a specific snapshot."""
         con = self._connect()
         rows = con.execute(
-            """
+            self._sql("""
             SELECT data_file_id, path, path_is_relative, record_count,
                    file_size_bytes, row_id_start, partition_id, mapping_id
             FROM ducklake_data_file
@@ -304,7 +309,7 @@ class DuckLakeCatalogReader:
               AND ? >= begin_snapshot
               AND (? < end_snapshot OR end_snapshot IS NULL)
             ORDER BY file_order, data_file_id
-            """,
+            """),
             [table_id, snapshot_id, snapshot_id],
         ).fetchall()
         return [
@@ -325,13 +330,13 @@ class DuckLakeCatalogReader:
         """Get delete files for a table at a specific snapshot."""
         con = self._connect()
         rows = con.execute(
-            """
+            self._sql("""
             SELECT delete_file_id, data_file_id, path, path_is_relative, delete_count
             FROM ducklake_delete_file
             WHERE table_id = ?
               AND ? >= begin_snapshot
               AND (? < end_snapshot OR end_snapshot IS NULL)
-            """,
+            """),
             [table_id, snapshot_id, snapshot_id],
         ).fetchall()
         return [
@@ -359,18 +364,19 @@ class DuckLakeCatalogReader:
 
         con = self._connect()
 
-        placeholders = ",".join(["?"] * len(data_file_ids))
+        ph = self._backend.placeholder
+        placeholders = ",".join([ph] * len(data_file_ids))
         params: list[Any] = [table_id, *data_file_ids]
 
         query = f"""
             SELECT data_file_id, column_id, null_count, min_value, max_value
             FROM ducklake_file_column_stats
-            WHERE table_id = ?
+            WHERE table_id = {ph}
               AND data_file_id IN ({placeholders})
         """
 
         if column_ids:
-            col_placeholders = ",".join(["?"] * len(column_ids))
+            col_placeholders = ",".join([ph] * len(column_ids))
             query += f" AND column_id IN ({col_placeholders})"
             params.extend(column_ids)
 
@@ -391,15 +397,15 @@ class DuckLakeCatalogReader:
         con = self._connect()
         try:
             rows = con.execute(
-                """
+                self._sql("""
                 SELECT table_id, table_name, schema_version
                 FROM ducklake_inlined_data_tables
                 WHERE table_id = ?
-                """,
+                """),
                 [table_id],
             ).fetchall()
-        except sqlite3.OperationalError as e:
-            if "no such table" in str(e):
+        except Exception as e:
+            if self._backend.is_table_not_found(e):
                 return []
             raise
         return [
@@ -437,17 +443,17 @@ class DuckLakeCatalogReader:
             safe_table = info.table_name.replace('"', '""')
             try:
                 cursor = con.execute(
-                    f"""
+                    self._sql(f"""
                     SELECT {cols_sql}
                     FROM "{safe_table}"
                     WHERE ? >= begin_snapshot
                       AND (? < end_snapshot OR end_snapshot IS NULL)
-                    """,
+                    """),
                     [snapshot_id, snapshot_id],
                 )
                 rows = cursor.fetchall()
-            except sqlite3.OperationalError as e:
-                if "no such table" in str(e):
+            except Exception as e:
+                if self._backend.is_table_not_found(e):
                     continue
                 raise
 

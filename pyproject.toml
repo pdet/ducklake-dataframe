@@ -14,6 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+postgres = ["psycopg2-binary>=2.9"]
 dev = [
     "pytest>=7.0",
     "pytest-xdist",
@@ -25,3 +26,6 @@ packages = ["src/ducklake_polars"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "postgres: PostgreSQL integration tests (require DUCKLAKE_PG_DSN env var)",
+]

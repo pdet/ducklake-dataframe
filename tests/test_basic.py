@@ -185,6 +185,9 @@ class TestEdgeCases:
         from pathlib import Path
 
         cat = ducklake_catalog
+        if cat.backend == "postgres":
+            pytest.skip("Path objects not applicable for PostgreSQL connection strings")
+
         cat.execute("CREATE TABLE ducklake.test (a INTEGER)")
         cat.execute("INSERT INTO ducklake.test VALUES (1)")
         cat.close()

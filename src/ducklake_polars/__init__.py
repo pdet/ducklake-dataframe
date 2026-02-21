@@ -29,7 +29,8 @@ def scan_ducklake(
     Parameters
     ----------
     path
-        Path to the DuckLake metadata catalog file (.ducklake or .db).
+        Path to the DuckLake metadata catalog file (.ducklake or .db),
+        or a PostgreSQL connection string (e.g., "postgresql://user:pass@host/dbname").
     table
         Name of the table to read.
     schema
@@ -92,7 +93,8 @@ def read_ducklake(
     Parameters
     ----------
     path
-        Path to the DuckLake metadata catalog file (.ducklake or .db).
+        Path to the DuckLake metadata catalog file (.ducklake or .db),
+        or a PostgreSQL connection string (e.g., "postgresql://user:pass@host/dbname").
     table
         Name of the table to read.
     schema

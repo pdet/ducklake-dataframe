@@ -56,8 +56,6 @@ class TestTimeTravel:
         assert result.shape == (1, 1)
 
     def test_read_at_snapshot_time(self, ducklake_catalog):
-        import sqlite3
-
         cat = ducklake_catalog
         cat.execute("CREATE TABLE ducklake.test (a INTEGER)")
         cat.execute("INSERT INTO ducklake.test VALUES (1)")
@@ -66,13 +64,11 @@ class TestTimeTravel:
         cat.execute("INSERT INTO ducklake.test VALUES (2)")
         cat.close()
 
-        # Read the snapshot time for v1 from the SQLite catalog directly
-        con = sqlite3.connect(cat.metadata_path)
-        ts = con.execute(
+        # Read the snapshot time for v1 from the catalog directly
+        ts = cat.query_metadata(
             "SELECT snapshot_time FROM ducklake_snapshot WHERE snapshot_id = ?",
             [v1],
-        ).fetchone()[0]
-        con.close()
+        )[0]
 
         # Read at the timestamp of v1 - should have 1 row
         result = read_ducklake(cat.metadata_path, "test", snapshot_time=ts)
