@@ -1,0 +1,464 @@
+"""DuckLake metadata catalog reader."""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import polars as pl
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+
+@dataclass
+class FileInfo:
+    """Information about a DuckLake data file."""
+
+    data_file_id: int
+    path: str
+    path_is_relative: bool
+    record_count: int
+    file_size_bytes: int
+    row_id_start: int
+    partition_id: int | None
+    mapping_id: int | None
+
+
+@dataclass
+class DeleteFileInfo:
+    """Information about a DuckLake delete file."""
+
+    delete_file_id: int
+    data_file_id: int
+    path: str
+    path_is_relative: bool
+    delete_count: int
+
+
+@dataclass
+class ColumnInfo:
+    """Information about a DuckLake column."""
+
+    column_id: int
+    column_name: str
+    column_type: str
+    column_order: int
+    parent_column: int | None
+    nulls_allowed: bool
+
+
+@dataclass
+class ColumnStats:
+    """Per-file column statistics."""
+
+    data_file_id: int
+    column_id: int
+    null_count: int | None
+    min_value: str | None
+    max_value: str | None
+
+
+@dataclass
+class TableInfo:
+    """Information about a DuckLake table."""
+
+    table_id: int
+    table_name: str
+    schema_id: int
+    table_path: str
+    table_path_is_relative: bool
+    schema_path: str
+    schema_path_is_relative: bool
+
+
+@dataclass
+class SnapshotInfo:
+    """DuckLake snapshot information."""
+
+    snapshot_id: int
+    schema_version: int
+    next_file_id: int
+
+
+@dataclass
+class InlinedDataTableInfo:
+    """Information about an inlined data table."""
+
+    table_id: int
+    table_name: str
+    schema_version: int
+
+
+class DuckLakeCatalogReader:
+    """
+    Reads metadata from a DuckLake catalog database.
+
+    Connects to the DuckLake metadata catalog (a SQLite database file)
+    and provides methods to query tables, columns, files, and statistics.
+    """
+
+    def __init__(
+        self,
+        metadata_path: str,
+        *,
+        data_path_override: str | None = None,
+    ) -> None:
+        self._metadata_path = os.path.abspath(metadata_path)
+        self._data_path_override = data_path_override
+        self._con: sqlite3.Connection | None = None
+        self._data_path: str | None = None
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._con is None:
+            self._con = sqlite3.connect(
+                f"file:{self._metadata_path}?mode=ro",
+                uri=True,
+            )
+        return self._con
+
+    def __enter__(self) -> DuckLakeCatalogReader:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._con is not None:
+            self._con.close()
+            self._con = None
+            self._data_path = None
+
+    @property
+    def data_path(self) -> str:
+        """Get the base data path for resolving relative file paths."""
+        if self._data_path is None:
+            if self._data_path_override is not None:
+                self._data_path = self._data_path_override
+            else:
+                con = self._connect()
+                row = con.execute(
+                    "SELECT value FROM ducklake_metadata WHERE key = 'data_path'"
+                ).fetchone()
+                if row is None:
+                    msg = "No data_path found in ducklake_metadata"
+                    raise ValueError(msg)
+                self._data_path = row[0]
+        return self._data_path
+
+    def resolve_data_file_path(self, file_path: str, file_is_relative: bool, table: TableInfo) -> str:
+        """Resolve a data file path including schema and table path components."""
+        if not file_is_relative:
+            return file_path
+
+        # Build the full path: data_path / schema_path / table_path / file_path
+        base = self.data_path
+
+        if table.schema_path_is_relative:
+            base = os.path.join(base, table.schema_path)
+        else:
+            base = table.schema_path
+
+        if table.table_path_is_relative:
+            base = os.path.join(base, table.table_path)
+        else:
+            base = table.table_path
+
+        return os.path.join(base, file_path)
+
+    def get_current_snapshot(self) -> SnapshotInfo:
+        """Get the current (latest) snapshot."""
+        con = self._connect()
+        row = con.execute("""
+            SELECT snapshot_id, schema_version, next_file_id
+            FROM ducklake_snapshot
+            WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+        """).fetchone()
+        if row is None:
+            msg = "No snapshots found in catalog"
+            raise ValueError(msg)
+        return SnapshotInfo(
+            snapshot_id=row[0],
+            schema_version=row[1],
+            next_file_id=row[2],
+        )
+
+    def get_snapshot_at_version(self, version: int) -> SnapshotInfo:
+        """Get snapshot info at a specific version."""
+        con = self._connect()
+        row = con.execute(
+            """
+            SELECT snapshot_id, schema_version, next_file_id
+            FROM ducklake_snapshot
+            WHERE snapshot_id = ?
+            """,
+            [version],
+        ).fetchone()
+        if row is None:
+            msg = f"Snapshot version {version} not found"
+            raise ValueError(msg)
+        return SnapshotInfo(
+            snapshot_id=row[0],
+            schema_version=row[1],
+            next_file_id=row[2],
+        )
+
+    def get_snapshot_at_time(self, timestamp: datetime | str) -> SnapshotInfo:
+        """Get the snapshot at or before a given timestamp."""
+        con = self._connect()
+        ts_str = timestamp if isinstance(timestamp, str) else timestamp.isoformat()
+        row = con.execute(
+            """
+            SELECT snapshot_id, schema_version, next_file_id
+            FROM ducklake_snapshot
+            WHERE snapshot_time <= ?
+            ORDER BY snapshot_id DESC
+            LIMIT 1
+            """,
+            [ts_str],
+        ).fetchone()
+        if row is None:
+            msg = f"No snapshot found at or before {timestamp}"
+            raise ValueError(msg)
+        return SnapshotInfo(
+            snapshot_id=row[0],
+            schema_version=row[1],
+            next_file_id=row[2],
+        )
+
+    def get_table(self, table_name: str, schema_name: str, snapshot_id: int) -> TableInfo:
+        """Get table info for a given table at a specific snapshot."""
+        con = self._connect()
+        row = con.execute(
+            """
+            SELECT t.table_id, t.table_name, t.schema_id,
+                   t.path, t.path_is_relative,
+                   s.path, s.path_is_relative
+            FROM ducklake_table t
+            JOIN ducklake_schema s ON t.schema_id = s.schema_id
+            WHERE t.table_name = ?
+              AND s.schema_name = ?
+              AND ? >= t.begin_snapshot
+              AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
+              AND ? >= s.begin_snapshot
+              AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
+            """,
+            [table_name, schema_name, snapshot_id, snapshot_id, snapshot_id, snapshot_id],
+        ).fetchone()
+        if row is None:
+            msg = f"Table '{schema_name}.{table_name}' not found at snapshot {snapshot_id}"
+            raise ValueError(msg)
+        return TableInfo(
+            table_id=row[0],
+            table_name=row[1],
+            schema_id=row[2],
+            table_path=row[3] or "",
+            table_path_is_relative=bool(row[4]) if row[4] is not None else True,
+            schema_path=row[5] or "",
+            schema_path_is_relative=bool(row[6]) if row[6] is not None else True,
+        )
+
+    def get_columns(self, table_id: int, snapshot_id: int) -> list[ColumnInfo]:
+        """Get top-level column definitions for a table at a specific snapshot."""
+        all_cols = self.get_all_columns(table_id, snapshot_id)
+        return [c for c in all_cols if c.parent_column is None]
+
+    def get_all_columns(self, table_id: int, snapshot_id: int) -> list[ColumnInfo]:
+        """Get all column definitions (including nested) for a table at a specific snapshot."""
+        con = self._connect()
+        rows = con.execute(
+            """
+            SELECT column_id, column_name, column_type, column_order,
+                   parent_column, nulls_allowed
+            FROM ducklake_column
+            WHERE table_id = ?
+              AND ? >= begin_snapshot
+              AND (? < end_snapshot OR end_snapshot IS NULL)
+            ORDER BY column_order
+            """,
+            [table_id, snapshot_id, snapshot_id],
+        ).fetchall()
+        return [
+            ColumnInfo(
+                column_id=r[0],
+                column_name=r[1],
+                column_type=r[2],
+                column_order=r[3],
+                parent_column=r[4],
+                nulls_allowed=bool(r[5]) if r[5] is not None else True,
+            )
+            for r in rows
+        ]
+
+    def get_data_files(self, table_id: int, snapshot_id: int) -> list[FileInfo]:
+        """Get data files for a table at a specific snapshot."""
+        con = self._connect()
+        rows = con.execute(
+            """
+            SELECT data_file_id, path, path_is_relative, record_count,
+                   file_size_bytes, row_id_start, partition_id, mapping_id
+            FROM ducklake_data_file
+            WHERE table_id = ?
+              AND ? >= begin_snapshot
+              AND (? < end_snapshot OR end_snapshot IS NULL)
+            ORDER BY file_order, data_file_id
+            """,
+            [table_id, snapshot_id, snapshot_id],
+        ).fetchall()
+        return [
+            FileInfo(
+                data_file_id=r[0],
+                path=r[1],
+                path_is_relative=bool(r[2]) if r[2] is not None else True,
+                record_count=r[3],
+                file_size_bytes=r[4],
+                row_id_start=r[5],
+                partition_id=r[6],
+                mapping_id=r[7],
+            )
+            for r in rows
+        ]
+
+    def get_delete_files(self, table_id: int, snapshot_id: int) -> list[DeleteFileInfo]:
+        """Get delete files for a table at a specific snapshot."""
+        con = self._connect()
+        rows = con.execute(
+            """
+            SELECT delete_file_id, data_file_id, path, path_is_relative, delete_count
+            FROM ducklake_delete_file
+            WHERE table_id = ?
+              AND ? >= begin_snapshot
+              AND (? < end_snapshot OR end_snapshot IS NULL)
+            """,
+            [table_id, snapshot_id, snapshot_id],
+        ).fetchall()
+        return [
+            DeleteFileInfo(
+                delete_file_id=r[0],
+                data_file_id=r[1],
+                path=r[2],
+                path_is_relative=bool(r[3]) if r[3] is not None else True,
+                delete_count=r[4],
+            )
+            for r in rows
+        ]
+
+    def get_column_stats(
+        self,
+        table_id: int,
+        data_file_ids: list[int],
+        column_ids: list[int] | None = None,
+    ) -> list[ColumnStats]:
+        """Get per-file column statistics."""
+        if not data_file_ids:
+            return []
+        if column_ids is not None and not column_ids:
+            return []
+
+        con = self._connect()
+
+        placeholders = ",".join(["?"] * len(data_file_ids))
+        params: list[Any] = [table_id, *data_file_ids]
+
+        query = f"""
+            SELECT data_file_id, column_id, null_count, min_value, max_value
+            FROM ducklake_file_column_stats
+            WHERE table_id = ?
+              AND data_file_id IN ({placeholders})
+        """
+
+        if column_ids:
+            col_placeholders = ",".join(["?"] * len(column_ids))
+            query += f" AND column_id IN ({col_placeholders})"
+            params.extend(column_ids)
+
+        rows = con.execute(query, params).fetchall()
+        return [
+            ColumnStats(
+                data_file_id=r[0],
+                column_id=r[1],
+                null_count=r[2],
+                min_value=r[3],
+                max_value=r[4],
+            )
+            for r in rows
+        ]
+
+    def get_inlined_data_tables(self, table_id: int) -> list[InlinedDataTableInfo]:
+        """Get inlined data table info for a table."""
+        con = self._connect()
+        try:
+            rows = con.execute(
+                """
+                SELECT table_id, table_name, schema_version
+                FROM ducklake_inlined_data_tables
+                WHERE table_id = ?
+                """,
+                [table_id],
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e):
+                return []
+            raise
+        return [
+            InlinedDataTableInfo(
+                table_id=r[0],
+                table_name=r[1],
+                schema_version=r[2],
+            )
+            for r in rows
+        ]
+
+    def read_inlined_data(
+        self,
+        table_id: int,
+        snapshot_id: int,
+        column_names: list[str],
+    ) -> pl.DataFrame | None:
+        """
+        Read inlined data from the metadata catalog.
+
+        Returns a Polars DataFrame with the inlined data, or None if
+        there is no inlined data.
+        """
+        inlined_tables = self.get_inlined_data_tables(table_id)
+        if not inlined_tables:
+            return None
+
+        con = self._connect()
+        frames: list[pl.DataFrame] = []
+
+        for info in inlined_tables:
+            cols_sql = ", ".join(
+                f'"{c.replace(chr(34), chr(34) + chr(34))}"' for c in column_names
+            )
+            safe_table = info.table_name.replace('"', '""')
+            try:
+                cursor = con.execute(
+                    f"""
+                    SELECT {cols_sql}
+                    FROM "{safe_table}"
+                    WHERE ? >= begin_snapshot
+                      AND (? < end_snapshot OR end_snapshot IS NULL)
+                    """,
+                    [snapshot_id, snapshot_id],
+                )
+                rows = cursor.fetchall()
+            except sqlite3.OperationalError as e:
+                if "no such table" in str(e):
+                    continue
+                raise
+
+            if rows:
+                data = {
+                    name: [row[i] for row in rows]
+                    for i, name in enumerate(column_names)
+                }
+                frames.append(pl.DataFrame(data))
+
+        if not frames:
+            return None
+
+        return pl.concat(frames)

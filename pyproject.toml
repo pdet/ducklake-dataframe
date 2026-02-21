@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ducklake-polars"
+version = "0.1.0"
+description = "Polars integration for DuckLake catalogs"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = [
+    "polars>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-xdist",
+    "duckdb>=1.2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ducklake_polars"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
