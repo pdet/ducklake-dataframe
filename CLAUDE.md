@@ -50,6 +50,30 @@ src/ducklake_polars/
 - These private APIs may change across Polars versions. If something breaks after
   a Polars upgrade, check these first.
 
+### Column rename support
+
+When `ALTER TABLE RENAME COLUMN` is used, old Parquet files still have the old physical column name.
+DuckLake tracks renames via snapshot-versioned rows in `ducklake_column` (same `column_id`, different
+`column_name` across snapshot boundaries). The rename logic:
+
+1. `get_column_history()` retrieves all column definitions across all snapshots
+2. `_has_renames()` checks if any column_id has multiple distinct names (fast path: no overhead if no renames)
+3. If renames exist, files are grouped by their physical column names via `_group_files_by_rename_map()`
+4. Each group is scanned separately with `scan_parquet`, collected eagerly, and old-name groups get `.rename()` applied
+5. Groups are concatenated, written to a temp Parquet file, and returned as `scan_parquet(tmp_path)`
+
+**Important**: The Polars dataset scan resolver only accepts bare Parquet SCAN nodes from
+`to_dataset_scan()`. Returning `.rename()` (WITH_COLUMNS), `pl.concat()` (UNION), or
+`df.lazy()` (DF) all fail with "unknown DSL when resolving python dataset scan". The temp
+file workaround is the only viable approach. Temp files are cleaned up via `atexit` handlers.
+
+### Partition pruning
+
+DuckLake stores partition metadata in three tables: `ducklake_partition_info`, `ducklake_partition_column`,
+`ducklake_file_partition_value`. For identity-transform partitions, partition values supplement the
+`_table_statistics` DataFrame as a fallback when `ducklake_file_column_stats` is incomplete.
+The logic is in `_build_partition_values_for_stats()` and integrated into `build_table_statistics()`.
+
 ### DuckLake metadata schema
 
 The catalog database (SQLite or PostgreSQL) contains these tables (among others):
@@ -63,6 +87,9 @@ The catalog database (SQLite or PostgreSQL) contains these tables (among others)
 - `ducklake_data_file` -- data_file_id, table_id, path, record_count, begin_snapshot, end_snapshot
 - `ducklake_delete_file` -- delete_file_id, data_file_id, table_id, path, begin_snapshot, end_snapshot
 - `ducklake_file_column_stats` -- data_file_id, column_id, null_count, min_value, max_value
+- `ducklake_partition_info` -- partition_id, table_id, begin_snapshot, end_snapshot
+- `ducklake_partition_column` -- partition_id, column_id, partition_key_index, transform
+- `ducklake_file_partition_value` -- data_file_id, table_id, partition_key_index, partition_value
 - `ducklake_inlined_data_tables` -- table_id, table_name, schema_version
 
 Snapshot visibility: a row is visible at snapshot S when `begin_snapshot <= S AND (end_snapshot IS NULL OR end_snapshot > S)`.
@@ -95,9 +122,10 @@ stored as lowercase DuckDB internal names like `"int32"`, `"varchar"`, `"boolean
   as Float64 in Parquet. This is a known DuckDB limitation; tests are marked `xfail`.
 - `INTERVAL` cannot be read by Polars from Parquet (month_day_millisecond_interval); `xfail`.
 - `MAP` reading is broken in Polars 1.36; `xfail`.
-- You **cannot** add WITH_COLUMNS (cast) operations inside the LazyFrame returned from
-  `to_dataset_scan()`. Polars rejects it with "unknown DSL when resolving python dataset scan".
-  This is why the schema must exactly match the Parquet physical types.
+- The LazyFrame returned from `to_dataset_scan()` **must be a bare Parquet SCAN node**.
+  Polars rejects WITH_COLUMNS (`.rename()`, `.cast()`), UNION (`pl.concat()`), and DF
+  (`df.lazy()`) with "unknown DSL when resolving python dataset scan". This is why the
+  schema must exactly match the Parquet physical types, and the rename path uses a temp file.
 
 ## How to build and test
 
@@ -133,16 +161,10 @@ SQLite file lock. For tests that need direct metadata access after closing, use
 Note: PostgreSQL tests should not be run in parallel (`pytest-xdist`) since they share a
 single database.
 
-Current test status: **284 passed, 1 skipped, 10 xfailed** (both SQLite and PostgreSQL backends).
-Known xfails: HUGEINT (2), UHUGEINT (2), INTERVAL (2), MAP (2), column RENAME (2).
+Current test status: **207 passed, 4 xfailed** on SQLite backend (doubled with PostgreSQL).
+Known xfails: HUGEINT, UHUGEINT, INTERVAL, MAP — DuckDB Parquet writer or Polars reader limitations.
 
 ## Known limitations and future work
-
-- **Column rename** (`ALTER TABLE RENAME COLUMN`) is not yet supported. DuckLake stores column
-  renames via `mapping_id` on data files; reading those files requires remapping column names.
-  Test is `xfail` with reason "Phase 2".
-- **Partition pruning** is not implemented. The catalog stores partition info but we don't
-  use it for file pruning yet.
 - **Non-default schemas** (e.g., `CREATE SCHEMA other`) are supported in the API (`schema="other"`)
   but not tested end-to-end.
 - **Inlined data type coercion** -- `read_inlined_data()` returns raw SQLite values without
@@ -156,6 +178,12 @@ Known xfails: HUGEINT (2), UHUGEINT (2), INTERVAL (2), MAP (2), column RENAME (2
 - **Thread safety** -- `DuckLakeCatalogReader` is not thread-safe. The `data_path` property
   uses a check-then-act pattern without locking.
 - **ENUM type** is not handled; will raise `ValueError("Unsupported DuckDB type: ...")`.
+- **Rename path temp files** -- when tables have renamed columns, the rename path collects
+  data eagerly and writes a temp Parquet file. These are cleaned up via `atexit` but accumulate
+  during long-running processes with many `scan_ducklake` calls on renamed tables.
+- **DuckLake partition syntax** -- partitioning uses `ALTER TABLE t SET PARTITIONED BY (col)`,
+  NOT `CREATE TABLE ... PARTITION BY (col)`. Only identity-transform partitions are currently
+  supported for pruning.
 
 ## Conventions
 
@@ -190,11 +218,14 @@ Known xfails: HUGEINT (2), UHUGEINT (2), INTERVAL (2), MAP (2), column RENAME (2
 - Key methods: `get_current_snapshot()`, `get_snapshot_at_version()`, `get_snapshot_at_time()`,
   `get_table()`, `get_columns()`, `get_all_columns()`, `get_data_files()`, `get_delete_files()`,
   `get_column_stats()`, `read_inlined_data()`, `get_all_snapshots()`, `get_all_schemas()`,
-  `get_all_tables()`, `get_all_metadata()`, `get_data_files_in_range()`,
-  `get_data_files_in_range_with_snapshot()`, `get_delete_files_in_range()`, `get_data_file_by_id()`.
+  `get_all_tables()`, `get_all_metadata()`, `get_data_files_in_range_with_snapshot()`,
+  `get_delete_files_in_range()`, `get_data_file_by_id()`, `get_column_history()`,
+  `get_partition_info()`, `get_partition_columns()`, `get_file_partition_values()`.
+- Dataclasses: `SnapshotInfo`, `TableInfo`, `ColumnInfo`, `FileInfo`, `DeleteFileInfo`,
+  `ColumnStats`, `ColumnHistoryEntry`, `PartitionInfo`, `PartitionColumnDef`, `FilePartitionValue`.
 - `resolve_data_file_path()` builds full paths: `data_path / schema_path / table_path / file_path`.
-- `except Exception` + `backend.is_table_not_found()` in `get_inlined_data_tables` and
-  `read_inlined_data` handles both SQLite and PostgreSQL missing-table errors.
+- `except Exception` + `backend.is_table_not_found()` in `get_inlined_data_tables`,
+  `read_inlined_data`, and partition methods handles both SQLite and PostgreSQL missing-table errors.
 
 ### `_catalog_api.py`
 - `DuckLakeCatalog` -- high-level catalog inspection class. All methods return `pl.DataFrame`
@@ -214,6 +245,11 @@ Known xfails: HUGEINT (2), UHUGEINT (2), INTERVAL (2), MAP (2), column RENAME (2
 - `to_dataset_scan()` returns `(LazyFrame, version_key)` (called by Polars during execution).
 - The `limit`, `projection`, `pyarrow_predicate` params are part of the interface but unused.
 - Creates a new `DuckLakeCatalogReader` per method call (no caching across schema/scan).
+- Module-level helpers for rename detection: `_has_renames()`, `_get_physical_name()`,
+  `_get_rename_map()`, `_group_files_by_rename_map()`.
+- `_build_partition_values_for_stats()` maps partition values to column IDs for stats supplementation.
+- `_safe_unlink()` for robust temp file cleanup in `atexit` handlers.
+- `_build_scan_kwargs()` static method extracts shared logic for building `scan_parquet` kwargs per file group.
 
 ### `_schema.py`
 - `_SIMPLE_TYPE_MAP` -- dict of ~67 entries mapping uppercase type names to Polars DataTypes.
@@ -229,3 +265,4 @@ Known xfails: HUGEINT (2), UHUGEINT (2), INTERVAL (2), MAP (2), column RENAME (2
   date, datetime, Decimal). Wrapped in try/except for resilience.
 - `build_table_statistics()` -- builds the DataFrame that Polars uses for file pruning.
   Format: `len` (UInt32), `{col}_nc` (UInt32), `{col}_min`, `{col}_max` per filter column.
+  Accepts optional `partition_values` dict to supplement missing column stats with partition values.

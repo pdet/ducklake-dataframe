@@ -58,6 +58,7 @@ def build_table_statistics(
     stats: list[ColumnStats],
     columns: list[ColumnInfo],
     filter_columns: list[str] | None = None,
+    partition_values: dict[int, dict[int, str | None]] | None = None,
 ) -> pl.DataFrame | None:
     """
     Build a _table_statistics DataFrame for scan_parquet.
@@ -67,8 +68,11 @@ def build_table_statistics(
     - For each filter column: '{col}_nc' (null count), '{col}_min', '{col}_max'
 
     Files are in the same order as the paths passed to scan_parquet.
+
+    If ``partition_values`` is provided, it supplements missing column stats
+    with partition values (for identity-transform partition columns).
     """
-    if not files or not stats:
+    if not files or (not stats and not partition_values):
         return None
 
     # Determine which columns to include stats for
@@ -122,6 +126,22 @@ def build_table_statistics(
                 nc_values.append(cs.null_count if cs.null_count is not None else 0)
                 min_values.append(_parse_stat_value(cs.min_value, polars_type))
                 max_values.append(_parse_stat_value(cs.max_value, polars_type))
+            elif (
+                partition_values
+                and file.data_file_id in partition_values
+                and col.column_id in partition_values[file.data_file_id]
+            ):
+                # Use partition value as both min and max (identity transform)
+                pval = partition_values[file.data_file_id][col.column_id]
+                if pval is None:
+                    nc_values.append(file.record_count)
+                    min_values.append(None)
+                    max_values.append(None)
+                else:
+                    parsed = _parse_stat_value(pval, polars_type)
+                    nc_values.append(0)
+                    min_values.append(parsed)
+                    max_values.append(parsed)
             else:
                 nc_values.append(None)
                 min_values.append(None)

@@ -26,6 +26,7 @@ class FileInfo:
     row_id_start: int
     partition_id: int | None
     mapping_id: int | None
+    begin_snapshot: int = 0
 
 
 @dataclass
@@ -91,6 +92,42 @@ class InlinedDataTableInfo:
     table_id: int
     table_name: str
     schema_version: int
+
+
+@dataclass
+class ColumnHistoryEntry:
+    """A single column definition across a snapshot range (for rename detection)."""
+
+    column_id: int
+    column_name: str
+    begin_snapshot: int
+    end_snapshot: int | None
+
+
+@dataclass
+class PartitionInfo:
+    """Partition spec for a table."""
+
+    partition_id: int
+
+
+@dataclass
+class PartitionColumnDef:
+    """A column in a partition spec."""
+
+    partition_id: int
+    column_id: int
+    partition_key_index: int
+    transform: str
+
+
+@dataclass
+class FilePartitionValue:
+    """A partition value for a specific file and partition key."""
+
+    data_file_id: int
+    partition_key_index: int
+    partition_value: str | None
 
 
 class DuckLakeCatalogReader:
@@ -309,7 +346,8 @@ class DuckLakeCatalogReader:
         rows = con.execute(
             self._sql("""
             SELECT data_file_id, path, path_is_relative, record_count,
-                   file_size_bytes, row_id_start, partition_id, mapping_id
+                   file_size_bytes, row_id_start, partition_id, mapping_id,
+                   begin_snapshot
             FROM ducklake_data_file
             WHERE table_id = ?
               AND ? >= begin_snapshot
@@ -328,6 +366,7 @@ class DuckLakeCatalogReader:
                 row_id_start=r[5],
                 partition_id=r[6],
                 mapping_id=r[7],
+                begin_snapshot=r[8],
             )
             for r in rows
         ]
@@ -394,6 +433,114 @@ class DuckLakeCatalogReader:
                 null_count=r[2],
                 min_value=r[3],
                 max_value=r[4],
+            )
+            for r in rows
+        ]
+
+    def get_column_history(self, table_id: int) -> list[ColumnHistoryEntry]:
+        """Get all column definitions across all snapshots (for rename detection)."""
+        con = self._connect()
+        rows = con.execute(
+            self._sql("""
+            SELECT column_id, column_name, begin_snapshot, end_snapshot
+            FROM ducklake_column
+            WHERE table_id = ?
+              AND parent_column IS NULL
+            ORDER BY column_id, begin_snapshot
+            """),
+            [table_id],
+        ).fetchall()
+        return [
+            ColumnHistoryEntry(
+                column_id=r[0],
+                column_name=r[1],
+                begin_snapshot=r[2],
+                end_snapshot=r[3],
+            )
+            for r in rows
+        ]
+
+    def get_partition_info(self, table_id: int, snapshot_id: int) -> PartitionInfo | None:
+        """Get the active partition spec for a table at a given snapshot."""
+        con = self._connect()
+        try:
+            row = con.execute(
+                self._sql("""
+                SELECT partition_id
+                FROM ducklake_partition_info
+                WHERE table_id = ?
+                  AND ? >= begin_snapshot
+                  AND (? < end_snapshot OR end_snapshot IS NULL)
+                """),
+                [table_id, snapshot_id, snapshot_id],
+            ).fetchone()
+        except Exception as e:
+            if self._backend.is_table_not_found(e):
+                return None
+            raise
+        if row is None:
+            return None
+        return PartitionInfo(partition_id=row[0])
+
+    def get_partition_columns(self, partition_id: int, table_id: int) -> list[PartitionColumnDef]:
+        """Get partition columns for a partition spec."""
+        con = self._connect()
+        try:
+            rows = con.execute(
+                self._sql("""
+                SELECT partition_id, column_id, partition_key_index, transform
+                FROM ducklake_partition_column
+                WHERE partition_id = ?
+                  AND table_id = ?
+                ORDER BY partition_key_index
+                """),
+                [partition_id, table_id],
+            ).fetchall()
+        except Exception as e:
+            if self._backend.is_table_not_found(e):
+                return []
+            raise
+        return [
+            PartitionColumnDef(
+                partition_id=r[0],
+                column_id=r[1],
+                partition_key_index=r[2],
+                transform=r[3],
+            )
+            for r in rows
+        ]
+
+    def get_file_partition_values(
+        self,
+        table_id: int,
+        data_file_ids: list[int],
+    ) -> list[FilePartitionValue]:
+        """Get partition values for a set of data files."""
+        if not data_file_ids:
+            return []
+
+        con = self._connect()
+        ph = self._backend.placeholder
+        placeholders = ",".join([ph] * len(data_file_ids))
+        try:
+            rows = con.execute(
+                f"""
+                SELECT data_file_id, partition_key_index, partition_value
+                FROM ducklake_file_partition_value
+                WHERE table_id = {ph}
+                  AND data_file_id IN ({placeholders})
+                """,
+                [table_id, *data_file_ids],
+            ).fetchall()
+        except Exception as e:
+            if self._backend.is_table_not_found(e):
+                return []
+            raise
+        return [
+            FilePartitionValue(
+                data_file_id=r[0],
+                partition_key_index=r[1],
+                partition_value=r[2],
             )
             for r in rows
         ]
@@ -473,6 +620,7 @@ class DuckLakeCatalogReader:
                     row_id_start=r[5],
                     partition_id=r[6],
                     mapping_id=r[7],
+                    begin_snapshot=r[8],
                 ),
                 r[8],
             )
@@ -521,7 +669,8 @@ class DuckLakeCatalogReader:
         row = con.execute(
             self._sql("""
             SELECT data_file_id, path, path_is_relative, record_count,
-                   file_size_bytes, row_id_start, partition_id, mapping_id
+                   file_size_bytes, row_id_start, partition_id, mapping_id,
+                   begin_snapshot
             FROM ducklake_data_file
             WHERE data_file_id = ?
             """),
@@ -538,6 +687,7 @@ class DuckLakeCatalogReader:
             row_id_start=row[5],
             partition_id=row[6],
             mapping_id=row[7],
+            begin_snapshot=row[8],
         )
 
     def get_inlined_data_tables(self, table_id: int) -> list[InlinedDataTableInfo]:

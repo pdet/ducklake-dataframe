@@ -70,6 +70,7 @@ ducklake-polars/
         test_schema_mapping.py   - unit tests for type string parsing
         test_time_travel.py      - version/timestamp queries
         test_delete.py           - deletion file handling
+        test_partition.py        - partition pruning tests
 ```
 
 ---
@@ -97,9 +98,9 @@ ducklake-polars/
 
 ### Current Test Status
 
-**284 passed, 1 skipped, 10 xfailed** (both SQLite and PostgreSQL backends)
+**207 passed, 4 xfailed** (SQLite backend; doubled with PostgreSQL when `DUCKLAKE_PG_DSN` is set)
 
-Known xfails: HUGEINT (2), UHUGEINT (2), INTERVAL (2), MAP (2), column RENAME (2) — all due to DuckDB Parquet writer or Polars reader limitations.
+Known xfails: HUGEINT, UHUGEINT, INTERVAL, MAP — all due to DuckDB Parquet writer or Polars reader limitations.
 
 ---
 
@@ -118,21 +119,25 @@ Known xfails: HUGEINT (2), UHUGEINT (2), INTERVAL (2), MAP (2), column RENAME (2
 
 ---
 
-## Next Phases
+### Phase 4: Column Rename Support & Partition Pruning ✅
+
+#### 4.1 Column Rename Support
+- [x] Detect renames via `ducklake_column` history (same `column_id`, different `column_name` across snapshots)
+- [x] Group data files by physical column names, scan each group separately
+- [x] Apply `.rename()` on groups with old names, write combined result to temp Parquet, return `scan_parquet(tmp_path)`
+- [x] Fast path: zero overhead when no renames detected
+- [x] Added `begin_snapshot` to `FileInfo`, `get_column_history()` to catalog
+- [x] Tests: single rename, multiple renames, rename+add, rename+filter, rename+delete, rename+time_travel
+
+#### 4.2 Partition Pruning
+- [x] Read partition info from `ducklake_partition_info` / `ducklake_partition_column`
+- [x] Read partition values from `ducklake_file_partition_value`
+- [x] Use partition values as fallback for file column statistics in `build_table_statistics()`
+- [x] Tests: basic partitioned read, filter on partition column, multi-column partitions, stats
 
 ---
 
-### Phase 4: Remaining Read Features
-
-#### 4.1 Column Rename Support
-- [ ] Handle `mapping_id` on data files for column name remapping
-- [ ] Read `ducklake_column_mapping` / `ducklake_name_mapping` tables
-- [ ] Currently xfail in tests
-
-#### 4.2 Partition Pruning
-- [ ] Read partition info from `ducklake_partition_info` / `ducklake_partition_column`
-- [ ] Read partition values from `ducklake_file_partition_value`
-- [ ] Use partition values for file pruning
+## Next Phases
 
 ---
 

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
+import os
+import tempfile
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -17,7 +21,112 @@ if TYPE_CHECKING:
     from polars import LazyFrame
     from polars.schema import Schema
 
-    from ducklake_polars._catalog import ColumnInfo
+    from ducklake_polars._catalog import (
+        ColumnHistoryEntry,
+        ColumnInfo,
+        DeleteFileInfo,
+        FileInfo,
+        FilePartitionValue,
+        PartitionColumnDef,
+        TableInfo,
+    )
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _has_renames(
+    history: list[ColumnHistoryEntry],
+    current_columns: list[ColumnInfo],
+) -> bool:
+    """Check if any column has been renamed by looking at the history."""
+    current_names = {c.column_id: c.column_name for c in current_columns}
+    for entry in history:
+        if entry.column_id in current_names and entry.column_name != current_names[entry.column_id]:
+            return True
+    return False
+
+
+def _get_physical_name(
+    column_id: int,
+    file_begin_snapshot: int,
+    history: list[ColumnHistoryEntry],
+) -> str | None:
+    """Get the physical column name that was active when the file was written."""
+    for entry in history:
+        if entry.column_id != column_id:
+            continue
+        # The entry is active at file_begin_snapshot if:
+        # begin_snapshot <= file_begin_snapshot AND (end_snapshot IS NULL OR end_snapshot > file_begin_snapshot)
+        if entry.begin_snapshot <= file_begin_snapshot and (
+            entry.end_snapshot is None or entry.end_snapshot > file_begin_snapshot
+        ):
+            return entry.column_name
+    return None
+
+
+def _get_rename_map(
+    file_begin_snapshot: int,
+    history: list[ColumnHistoryEntry],
+    current_columns: list[ColumnInfo],
+) -> dict[str, str]:
+    """Get {physical_name -> current_name} for columns that differ."""
+    rename_map: dict[str, str] = {}
+    for col in current_columns:
+        physical = _get_physical_name(col.column_id, file_begin_snapshot, history)
+        if physical is not None and physical != col.column_name:
+            rename_map[physical] = col.column_name
+    return rename_map
+
+
+def _group_files_by_rename_map(
+    files: list[FileInfo],
+    history: list[ColumnHistoryEntry],
+    current_columns: list[ColumnInfo],
+) -> list[tuple[dict[str, str], list[FileInfo]]]:
+    """Group files by their rename map (files with identical mappings together)."""
+    # Use a dict keyed by frozenset of rename_map items
+    groups: dict[frozenset[tuple[str, str]], list[FileInfo]] = defaultdict(list)
+    rename_maps: dict[frozenset[tuple[str, str]], dict[str, str]] = {}
+
+    for f in files:
+        rmap = _get_rename_map(f.begin_snapshot, history, current_columns)
+        key = frozenset(rmap.items())
+        groups[key].append(f)
+        if key not in rename_maps:
+            rename_maps[key] = rmap
+
+    return [(rename_maps[k], group) for k, group in groups.items()]
+
+
+def _build_partition_values_for_stats(
+    partition_columns: list[PartitionColumnDef],
+    file_partition_values: list[FilePartitionValue],
+) -> dict[int, dict[int, str | None]]:
+    """Build a lookup of {data_file_id: {column_id: partition_value}}.
+
+    Only includes partition columns that use the identity transform.
+    """
+    # Map partition_key_index -> column_id
+    identity_key_to_col: dict[int, int] = {}
+    for pc in partition_columns:
+        if pc.transform == "identity":
+            identity_key_to_col[pc.partition_key_index] = pc.column_id
+
+    if not identity_key_to_col:
+        return {}
+
+    result: dict[int, dict[int, str | None]] = {}
+    for fpv in file_partition_values:
+        if fpv.partition_key_index in identity_key_to_col:
+            col_id = identity_key_to_col[fpv.partition_key_index]
+            result.setdefault(fpv.data_file_id, {})[col_id] = fpv.partition_value
+
+    return result
 
 
 @dataclass
@@ -78,6 +187,58 @@ class DuckLakeDataset:
             all_columns = reader.get_all_columns(table.table_id, snapshot.snapshot_id)
             return pl.Schema(self._build_schema_from_columns(all_columns))
 
+    @staticmethod
+    def _build_scan_kwargs(
+        group_files: list[FileInfo],
+        all_data_files: list[FileInfo],
+        delete_files: list[DeleteFileInfo],
+        reader: DuckLakeCatalogReader,
+        table: TableInfo,
+        columns: list[ColumnInfo],
+        filter_columns: list[str] | None,
+        partition_values: dict[int, dict[int, str | None]] | None,
+    ) -> dict[str, Any]:
+        """Build scan_parquet kwargs for a group of files."""
+        kwargs: dict[str, Any] = {
+            "missing_columns": "insert",
+            "extra_columns": "ignore",
+        }
+
+        # Build deletion files mapping for this group
+        if delete_files:
+            file_id_to_idx = {
+                f.data_file_id: i for i, f in enumerate(group_files)
+            }
+            deletion_files_map: dict[int, list[str]] = {}
+            for df in delete_files:
+                idx = file_id_to_idx.get(df.data_file_id)
+                if idx is not None:
+                    path = reader.resolve_data_file_path(df.path, df.path_is_relative, table)
+                    deletion_files_map.setdefault(idx, []).append(path)
+            if deletion_files_map:
+                kwargs["_deletion_files"] = (
+                    "iceberg-position-delete",
+                    deletion_files_map,
+                )
+
+        # Build table statistics for this group
+        if filter_columns:
+            file_ids = [f.data_file_id for f in group_files]
+            col_ids = [
+                c.column_id
+                for c in columns
+                if c.column_name in filter_columns
+            ]
+            stats = reader.get_column_stats(table.table_id, file_ids, col_ids)
+            table_statistics = build_table_statistics(
+                group_files, stats, columns, filter_columns,
+                partition_values=partition_values,
+            )
+            if table_statistics is not None:
+                kwargs["_table_statistics"] = table_statistics
+
+        return kwargs
+
     def to_dataset_scan(
         self,
         *,
@@ -129,66 +290,92 @@ class DuckLakeDataset:
                 if inlined is not None and not inlined.is_empty():
                     return inlined.lazy(), version_key
                 # Empty table - return scan_parquet with empty list
-                # This works because scan_parquet([]) produces a valid empty LazyFrame
                 schema_dict = self._build_schema_from_columns(all_columns)
                 return scan_parquet(
                     [],
                     schema=schema_dict,
                 ), version_key
 
-            # Resolve file paths
-            sources = [
-                reader.resolve_data_file_path(f.path, f.path_is_relative, table)
-                for f in data_files
-            ]
-
             # Get delete files
             delete_files = reader.get_delete_files(table.table_id, snapshot.snapshot_id)
 
-            # Build deletion files mapping: {file_index: [delete_file_paths]}
-            deletion_files_map: dict[int, list[str]] | None = None
-            if delete_files:
-                # Map data_file_id -> file index in sources list
-                file_id_to_idx = {
-                    f.data_file_id: i for i, f in enumerate(data_files)
-                }
-                deletion_files_map = {}
-                for df in delete_files:
-                    idx = file_id_to_idx.get(df.data_file_id)
-                    if idx is not None:
-                        path = reader.resolve_data_file_path(df.path, df.path_is_relative, table)
-                        deletion_files_map.setdefault(idx, []).append(path)
-
-            # Build table statistics for file pruning
-            table_statistics = None
+            # Fetch partition values for statistics supplementation
+            partition_values: dict[int, dict[int, str | None]] | None = None
             if filter_columns:
-                file_ids = [f.data_file_id for f in data_files]
-                col_ids = [
-                    c.column_id
-                    for c in columns
-                    if c.column_name in filter_columns
+                try:
+                    part_info = reader.get_partition_info(table.table_id, snapshot.snapshot_id)
+                    if part_info is not None:
+                        part_cols = reader.get_partition_columns(part_info.partition_id, table.table_id)
+                        # Check if any partition columns overlap with filter columns
+                        col_id_to_name = {c.column_id: c.column_name for c in columns}
+                        part_col_names = {col_id_to_name[pc.column_id] for pc in part_cols if pc.column_id in col_id_to_name}
+                        if part_col_names & set(filter_columns):
+                            file_ids = [f.data_file_id for f in data_files]
+                            fpvs = reader.get_file_partition_values(table.table_id, file_ids)
+                            partition_values = _build_partition_values_for_stats(
+                                part_cols, fpvs,
+                            )
+                except Exception as e:
+                    if not reader._backend.is_table_not_found(e):
+                        raise
+
+            # Detect column renames
+            history = reader.get_column_history(table.table_id)
+            has_rename = _has_renames(history, columns)
+
+            if not has_rename:
+                # Fast path: no renames, existing code
+                sources = [
+                    reader.resolve_data_file_path(f.path, f.path_is_relative, table)
+                    for f in data_files
                 ]
-                stats = reader.get_column_stats(table.table_id, file_ids, col_ids)
-                table_statistics = build_table_statistics(
-                    data_files, stats, columns, filter_columns
+
+                kwargs = self._build_scan_kwargs(
+                    data_files, data_files, delete_files, reader, table,
+                    columns, filter_columns, partition_values,
                 )
 
-            # Build scan_parquet kwargs
-            kwargs: dict[str, Any] = {
-                "missing_columns": "insert",
-                "extra_columns": "ignore",
-            }
+                lf = scan_parquet(sources, **kwargs)
+            else:
+                # Rename path: the dataset scan resolver only accepts bare
+                # Parquet SCAN nodes.  We collect each file group eagerly,
+                # apply renames, write the combined result to a temporary
+                # Parquet file, and return scan_parquet on that file.
+                groups = _group_files_by_rename_map(data_files, history, columns)
 
-            if table_statistics is not None:
-                kwargs["_table_statistics"] = table_statistics
+                group_dfs: list[pl.DataFrame] = []
+                for rename_map, group_files_list in groups:
+                    sources = [
+                        reader.resolve_data_file_path(f.path, f.path_is_relative, table)
+                        for f in group_files_list
+                    ]
 
-            if deletion_files_map:
-                kwargs["_deletion_files"] = (
-                    "iceberg-position-delete",
-                    deletion_files_map,
+                    kwargs = self._build_scan_kwargs(
+                        group_files_list, data_files, delete_files, reader, table,
+                        columns, filter_columns, partition_values,
+                    )
+
+                    df = scan_parquet(sources, **kwargs).collect()
+                    if rename_map:
+                        df = df.rename(rename_map)
+                    group_dfs.append(df)
+
+                if len(group_dfs) == 1:
+                    combined = group_dfs[0]
+                else:
+                    combined = pl.concat(group_dfs, how="diagonal_relaxed")
+
+                # Write to temp file and scan it (resolver needs Parquet SCAN)
+                fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+                os.close(fd)
+                atexit.register(lambda p=tmp_path: _safe_unlink(p))
+                combined.write_parquet(tmp_path)
+
+                lf = scan_parquet(
+                    tmp_path,
+                    missing_columns="insert",
+                    extra_columns="ignore",
                 )
-
-            lf = scan_parquet(sources, **kwargs)
 
             # If there's inlined data, we need to combine it
             inlined = reader.read_inlined_data(
