@@ -1,10 +1,10 @@
 # ducklake-polars
 
+> **This project is a proof of concept. It was 100% written by [Claude Code](https://docs.anthropic.com/en/docs/build-with-claude/claude-code/overview) (Anthropic's AI coding agent). It is not intended for production use.**
+
 A pure-Python [Polars](https://pola.rs/) integration for [DuckLake](https://ducklake.select/) catalogs.
 
 Reads DuckLake metadata directly from SQLite or PostgreSQL (no DuckDB runtime dependency) and scans the underlying Parquet data files through Polars' native Parquet reader. This gives you lazy evaluation, predicate pushdown, projection pushdown, and all other Polars optimizations out of the box.
-
-> **Note:** This project was developed almost entirely by [Claude Code](https://docs.anthropic.com/en/docs/build-with-claude/claude-code/overview) (Anthropic's AI coding agent) with minor human supervision.
 
 ## Installation
 

@@ -10,6 +10,8 @@ from ducklake_polars._backend import create_backend
 
 import polars as pl
 
+SUPPORTED_DUCKLAKE_VERSIONS = {"0.3"}
+
 if TYPE_CHECKING:
     from datetime import datetime
 
@@ -153,7 +155,24 @@ class DuckLakeCatalogReader:
     def _connect(self) -> Any:
         if self._con is None:
             self._con = self._backend.connect()
+            self._check_version()
         return self._con
+
+    def _check_version(self) -> None:
+        """Validate the DuckLake catalog version is supported."""
+        row = self._con.execute(
+            self._sql("SELECT value FROM ducklake_metadata WHERE key = 'version'")
+        ).fetchone()
+        if row is None:
+            msg = "No version found in ducklake_metadata — is this a valid DuckLake catalog?"
+            raise ValueError(msg)
+        version = row[0]
+        if version not in SUPPORTED_DUCKLAKE_VERSIONS:
+            msg = (
+                f"Unsupported DuckLake catalog version '{version}'. "
+                f"Supported versions: {', '.join(sorted(SUPPORTED_DUCKLAKE_VERSIONS))}"
+            )
+            raise ValueError(msg)
 
     def _sql(self, query: str) -> str:
         """Translate ``?`` placeholders to the backend's parameter style.
