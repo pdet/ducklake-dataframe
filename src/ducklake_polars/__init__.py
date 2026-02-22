@@ -23,6 +23,7 @@ __all__ = [
     "alter_ducklake_add_column",
     "alter_ducklake_drop_column",
     "alter_ducklake_rename_column",
+    "alter_ducklake_set_partitioned_by",
     "drop_ducklake_table",
     "create_ducklake_schema",
     "drop_ducklake_schema",
@@ -627,3 +628,46 @@ def rename_ducklake_table(
 
     with DuckLakeCatalogWriter(metadata_path, data_path_override=dp) as writer:
         writer.rename_table(old_table, new_table, schema_name=schema)
+
+
+def alter_ducklake_set_partitioned_by(
+    path: str | Path,
+    table: str,
+    columns: list[str],
+    *,
+    schema: str = "main",
+    data_path: str | Path | None = None,
+) -> None:
+    """
+    Set identity-transform partitioning on a DuckLake table.
+
+    Equivalent to ``ALTER TABLE t SET PARTITIONED BY (col1, col2, ...)``.
+    Future inserts will write one Parquet file per unique combination of
+    partition column values, using Hive-style directory layout.
+
+    Parameters
+    ----------
+    path
+        Path to the DuckLake metadata catalog file (.ducklake or .db).
+        Currently only SQLite backends are supported for writes.
+    table
+        Name of the table to partition.
+    columns
+        Column names to partition by (identity transform).
+    schema
+        Schema name (default: "main").
+    data_path
+        Override the data path stored in the catalog.
+
+    Raises
+    ------
+    ValueError
+        If the table or any column does not exist.
+    """
+    from ducklake_polars._writer import DuckLakeCatalogWriter
+
+    metadata_path = os.fspath(path)
+    dp = os.fspath(data_path) if data_path is not None else None
+
+    with DuckLakeCatalogWriter(metadata_path, data_path_override=dp) as writer:
+        writer.set_partitioned_by(table, columns, schema_name=schema)
