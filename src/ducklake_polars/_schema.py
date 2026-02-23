@@ -235,7 +235,14 @@ def polars_type_to_duckdb(dtype: pl.DataType) -> str:
     Returns lowercase type strings as stored in ``ducklake_column.column_type``.
     For compound types (List, Struct), returns the parent type string;
     children must be registered separately via the column hierarchy.
+
+    Accepts both instantiated types (``pl.String()``) and bare type classes
+    (``pl.String``).
     """
+    # Handle bare type classes (e.g. pl.String instead of pl.String())
+    if isinstance(dtype, type):
+        dtype = dtype()  # type: ignore[assignment]
+
     base = type(dtype)
 
     # Simple scalar types

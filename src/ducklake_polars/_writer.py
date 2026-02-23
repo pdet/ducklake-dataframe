@@ -1764,6 +1764,143 @@ class DuckLakeCatalogWriter:
             base = table_path
         return os.path.join(base, file_path)
 
+    def _get_active_delete_positions(
+        self,
+        data_file_id: int,
+        table_id: int,
+        snapshot_id: int,
+        table_path: str,
+        table_path_rel: bool,
+        schema_path: str,
+        schema_path_rel: bool,
+    ) -> set[int]:
+        """Return row positions that are deleted for a data file at the given snapshot.
+
+        Reads all active position-delete files for *data_file_id* and returns
+        a set of row positions that should be excluded when reading the data
+        file.
+        """
+        con = self._connect()
+        rows = con.execute(
+            "SELECT path, path_is_relative "
+            "FROM ducklake_delete_file "
+            "WHERE table_id = ? AND data_file_id = ? "
+            "AND begin_snapshot <= ? "
+            "AND (end_snapshot IS NULL OR end_snapshot > ?)",
+            [table_id, data_file_id, snapshot_id, snapshot_id],
+        ).fetchall()
+
+        if not rows:
+            return set()
+
+        positions: set[int] = set()
+        for del_path, del_is_rel in rows:
+            abs_del = self._resolve_file_path(
+                del_path,
+                bool(del_is_rel) if del_is_rel is not None else True,
+                table_path, table_path_rel,
+                schema_path, schema_path_rel,
+            )
+            try:
+                del_df = pl.read_parquet(abs_del)
+                positions.update(del_df["pos"].to_list())
+            except Exception:
+                pass
+
+        return positions
+
+    def _read_active_data_file(
+        self,
+        data_file_id: int,
+        abs_path: str,
+        table_id: int,
+        snapshot_id: int,
+        table_path: str,
+        table_path_rel: bool,
+        schema_path: str,
+        schema_path_rel: bool,
+    ) -> pl.DataFrame:
+        """Read a data file and exclude rows covered by active delete files."""
+        df = pl.read_parquet(abs_path)
+        deleted_positions = self._get_active_delete_positions(
+            data_file_id, table_id, snapshot_id,
+            table_path, table_path_rel, schema_path, schema_path_rel,
+        )
+        if deleted_positions:
+            # Add row index, filter out deleted positions, drop index
+            df = (
+                df.with_row_index("__row_idx__")
+                .filter(~pl.col("__row_idx__").is_in(list(deleted_positions)))
+                .drop("__row_idx__")
+            )
+        return df
+
+    def _write_cumulative_delete_file(
+        self,
+        data_file_id: int,
+        table_id: int,
+        new_snap: int,
+        snapshot_id: int,
+        new_positions: list[int],
+        abs_data_path: str,
+        base_dir: str,
+        delete_file_id: int,
+        table_path: str,
+        table_path_rel: bool,
+        schema_path: str,
+        schema_path_rel: bool,
+    ) -> None:
+        """Write a cumulative delete file that combines existing + new positions.
+
+        DuckLake expects each new delete file to contain ALL deleted positions
+        for the data file (not just the new ones). The previous delete file(s)
+        are superseded by setting their ``end_snapshot``.
+        """
+        con = self._connect()
+
+        # Get existing delete positions from active delete files
+        existing_positions = self._get_active_delete_positions(
+            data_file_id, table_id, snapshot_id,
+            table_path, table_path_rel, schema_path, schema_path_rel,
+        )
+
+        # Combine all positions
+        all_positions = sorted(set(existing_positions) | set(new_positions))
+
+        # Supersede existing delete files for this data file
+        con.execute(
+            "UPDATE ducklake_delete_file SET end_snapshot = ? "
+            "WHERE table_id = ? AND data_file_id = ? "
+            "AND begin_snapshot <= ? "
+            "AND (end_snapshot IS NULL OR end_snapshot > ?)",
+            [new_snap, table_id, data_file_id, snapshot_id, snapshot_id],
+        )
+
+        # Write new cumulative delete file
+        delete_df = pl.DataFrame({
+            "file_path": [abs_data_path] * len(all_positions),
+            "pos": pl.Series(all_positions, dtype=pl.Int64),
+        })
+        delete_file_name = f"ducklake-{_uuid7()}-delete.parquet"
+        delete_file_path = os.path.join(base_dir, delete_file_name)
+        delete_df.write_parquet(delete_file_path)
+
+        delete_file_size = os.path.getsize(delete_file_path)
+        delete_footer_size = _read_parquet_footer_size(delete_file_path)
+
+        con.execute(
+            "INSERT INTO ducklake_delete_file "
+            "(delete_file_id, table_id, begin_snapshot, end_snapshot, "
+            "data_file_id, path, path_is_relative, format, delete_count, "
+            "file_size_bytes, footer_size, encryption_key) "
+            "VALUES (?, ?, ?, NULL, ?, ?, ?, 'parquet', ?, ?, ?, NULL)",
+            [
+                delete_file_id, table_id, new_snap, data_file_id,
+                delete_file_name, True, len(all_positions),
+                delete_file_size, delete_footer_size,
+            ],
+        )
+
     def delete_data(
         self,
         predicate: pl.Expr,
@@ -1817,9 +1954,18 @@ class DuckLakeCatalogWriter:
                     table_path, table_path_rel,
                     schema_path, schema_path_rel,
                 )
-                df = pl.read_parquet(abs_path)
-                mask = df.with_columns(predicate.alias("__delete_mask__"))["__delete_mask__"]
-                positions = [i for i, v in enumerate(mask.to_list()) if v]
+                # Read the raw file and find already-deleted positions
+                raw_df = pl.read_parquet(abs_path)
+                already_deleted = self._get_active_delete_positions(
+                    data_file_id, table_id, snap_id,
+                    table_path, table_path_rel, schema_path, schema_path_rel,
+                )
+                # Evaluate predicate on all rows, but only count non-deleted ones
+                mask = raw_df.with_columns(predicate.alias("__delete_mask__"))["__delete_mask__"]
+                positions = [
+                    i for i, v in enumerate(mask.to_list())
+                    if v and i not in already_deleted
+                ]
                 if positions:
                     pending_deletes.append((data_file_id, abs_path, positions))
                     total_deleted += len(positions)
@@ -1855,28 +2001,10 @@ class DuckLakeCatalogWriter:
                 delete_file_id = current_file_id
                 current_file_id += 1
 
-                delete_df = pl.DataFrame({
-                    "file_path": [abs_data_path] * len(positions),
-                    "pos": pl.Series(positions, dtype=pl.Int64),
-                })
-                delete_file_name = f"ducklake-{_uuid7()}-delete.parquet"
-                delete_file_path = os.path.join(base, delete_file_name)
-                delete_df.write_parquet(delete_file_path)
-
-                delete_file_size = os.path.getsize(delete_file_path)
-                delete_footer_size = _read_parquet_footer_size(delete_file_path)
-
-                con.execute(
-                    "INSERT INTO ducklake_delete_file "
-                    "(delete_file_id, table_id, begin_snapshot, end_snapshot, "
-                    "data_file_id, path, path_is_relative, format, delete_count, "
-                    "file_size_bytes, footer_size, encryption_key) "
-                    "VALUES (?, ?, ?, NULL, ?, ?, ?, 'parquet', ?, ?, ?, NULL)",
-                    [
-                        delete_file_id, table_id, new_snap, data_file_id,
-                        delete_file_name, True, len(positions),
-                        delete_file_size, delete_footer_size,
-                    ],
+                self._write_cumulative_delete_file(
+                    data_file_id, table_id, new_snap, snap_id,
+                    positions, abs_data_path, base, delete_file_id,
+                    table_path, table_path_rel, schema_path, schema_path_rel,
                 )
 
         # Delete from inlined data (set end_snapshot)
@@ -2007,12 +2135,23 @@ class DuckLakeCatalogWriter:
                 table_path, table_path_rel,
                 schema_path, schema_path_rel,
             )
-            df = pl.read_parquet(abs_path)
-            mask = df.with_columns(predicate.alias("__mask__"))["__mask__"]
-            positions = [i for i, v in enumerate(mask.to_list()) if v]
+            raw_df = pl.read_parquet(abs_path)
+            already_deleted = self._get_active_delete_positions(
+                data_file_id, table_id, snap_id,
+                table_path, table_path_rel, schema_path, schema_path_rel,
+            )
+            mask = raw_df.with_columns(predicate.alias("__mask__"))["__mask__"]
+            positions = [
+                i for i, v in enumerate(mask.to_list())
+                if v and i not in already_deleted
+            ]
             if positions:
                 pending_deletes.append((data_file_id, abs_path, positions))
-                matched_dfs.append(df.filter(predicate))
+                # Filter to matched active rows only
+                active_matched = raw_df.with_row_index("__ri__").filter(
+                    pl.col("__ri__").is_in(positions)
+                ).drop("__ri__")
+                matched_dfs.append(active_matched)
                 total_updated += len(positions)
 
         # Check inlined data for matches
@@ -2073,28 +2212,10 @@ class DuckLakeCatalogWriter:
             delete_file_id = current_file_id
             current_file_id += 1
 
-            delete_df = pl.DataFrame({
-                "file_path": [abs_data_path] * len(positions),
-                "pos": pl.Series(positions, dtype=pl.Int64),
-            })
-            delete_file_name = f"ducklake-{_uuid7()}-delete.parquet"
-            delete_file_path = os.path.join(base, delete_file_name)
-            delete_df.write_parquet(delete_file_path)
-
-            delete_file_size = os.path.getsize(delete_file_path)
-            delete_footer_size = _read_parquet_footer_size(delete_file_path)
-
-            con.execute(
-                "INSERT INTO ducklake_delete_file "
-                "(delete_file_id, table_id, begin_snapshot, end_snapshot, "
-                "data_file_id, path, path_is_relative, format, delete_count, "
-                "file_size_bytes, footer_size, encryption_key) "
-                "VALUES (?, ?, ?, NULL, ?, ?, ?, 'parquet', ?, ?, ?, NULL)",
-                [
-                    delete_file_id, table_id, new_snap, data_file_id,
-                    delete_file_name, True, len(positions),
-                    delete_file_size, delete_footer_size,
-                ],
+            self._write_cumulative_delete_file(
+                data_file_id, table_id, new_snap, snap_id,
+                positions, abs_data_path, base, delete_file_id,
+                table_path, table_path_rel, schema_path, schema_path_rel,
             )
 
         # Delete inlined rows (set end_snapshot)
@@ -2318,11 +2439,22 @@ class DuckLakeCatalogWriter:
                 table_path, table_path_rel,
                 schema_path, schema_path_rel,
             )
-            file_df = pl.read_parquet(abs_path)
-            all_target_key_dfs.append(file_df.select(on))
+            raw_df = pl.read_parquet(abs_path)
+            already_deleted = self._get_active_delete_positions(
+                data_file_id, table_id, snap_id,
+                table_path, table_path_rel, schema_path, schema_path_rel,
+            )
+            # Work with row indices to exclude already-deleted rows
+            file_df = raw_df.with_row_index("__merge_idx__")
+            if already_deleted:
+                file_df = file_df.filter(
+                    ~pl.col("__merge_idx__").is_in(list(already_deleted))
+                )
+            active_df = file_df.drop("__merge_idx__")
+            all_target_key_dfs.append(active_df.select(on))
 
             if when_matched_update is not None:
-                file_df_idx = file_df.with_row_index("__merge_idx__")
+                file_df_idx = file_df  # already has __merge_idx__
                 matched = file_df_idx.join(source_keys, on=on, how="semi")
                 if len(matched) > 0:
                     positions = sorted(matched["__merge_idx__"].to_list())
@@ -2464,28 +2596,10 @@ class DuckLakeCatalogWriter:
             delete_file_id = current_file_id
             current_file_id += 1
 
-            delete_df = pl.DataFrame({
-                "file_path": [abs_data_path] * len(positions),
-                "pos": pl.Series(positions, dtype=pl.Int64),
-            })
-            delete_file_name = f"ducklake-{_uuid7()}-delete.parquet"
-            delete_file_path = os.path.join(base, delete_file_name)
-            delete_df.write_parquet(delete_file_path)
-
-            delete_file_size = os.path.getsize(delete_file_path)
-            delete_footer_size = _read_parquet_footer_size(delete_file_path)
-
-            con.execute(
-                "INSERT INTO ducklake_delete_file "
-                "(delete_file_id, table_id, begin_snapshot, end_snapshot, "
-                "data_file_id, path, path_is_relative, format, delete_count, "
-                "file_size_bytes, footer_size, encryption_key) "
-                "VALUES (?, ?, ?, NULL, ?, ?, ?, 'parquet', ?, ?, ?, NULL)",
-                [
-                    delete_file_id, table_id, new_snap, data_file_id,
-                    delete_file_name, True, len(positions),
-                    delete_file_size, delete_footer_size,
-                ],
+            self._write_cumulative_delete_file(
+                data_file_id, table_id, new_snap, snap_id,
+                positions, abs_data_path, base, delete_file_id,
+                table_path, table_path_rel, schema_path, schema_path_rel,
             )
 
         # Delete matched inlined rows

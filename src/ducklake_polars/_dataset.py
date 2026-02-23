@@ -61,8 +61,18 @@ def _cast_inlined_to_schema(
         elif isinstance(target, pl.Boolean) and current in (pl.Int64, pl.Int32, pl.Int8):
             cast_exprs.append(pl.col(col_name).cast(pl.Boolean))
         elif isinstance(target, pl.Datetime):
-            # DuckDB writes all timestamps as microseconds in Parquet
-            cast_exprs.append(pl.col(col_name).cast(pl.Datetime("us")))
+            if current in (pl.String, pl.Utf8):
+                # SQLite stores timestamps as strings — parse them
+                cast_exprs.append(
+                    pl.col(col_name).str.to_datetime(time_unit="us", strict=False)
+                )
+            else:
+                # DuckDB writes all timestamps as microseconds in Parquet
+                cast_exprs.append(pl.col(col_name).cast(pl.Datetime("us")))
+        elif isinstance(target, pl.Date) and current in (pl.String, pl.Utf8):
+            cast_exprs.append(pl.col(col_name).str.to_date(strict=False))
+        elif isinstance(target, pl.Time) and current in (pl.String, pl.Utf8):
+            cast_exprs.append(pl.col(col_name).str.to_time(strict=False))
         else:
             try:
                 cast_exprs.append(pl.col(col_name).cast(target))
