@@ -159,6 +159,7 @@ def write_ducklake(
     schema: str = "main",
     mode: str = "error",
     data_path: str | Path | None = None,
+    data_inlining_row_limit: int = 0,
 ) -> None:
     """
     Write a Polars DataFrame to a DuckLake table.
@@ -183,6 +184,11 @@ def write_ducklake(
           table if it does not exist.
     data_path
         Override the data path stored in the catalog.
+    data_inlining_row_limit
+        Maximum number of rows to store inline in the metadata catalog
+        instead of writing Parquet files. Set to 0 (default) to disable
+        inlining. When enabled, small inserts below this threshold are
+        stored directly in the catalog database.
 
     Raises
     ------
@@ -199,7 +205,11 @@ def write_ducklake(
     metadata_path = os.fspath(path)
     dp = os.fspath(data_path) if data_path is not None else None
 
-    with DuckLakeCatalogWriter(metadata_path, data_path_override=dp) as writer:
+    with DuckLakeCatalogWriter(
+        metadata_path,
+        data_path_override=dp,
+        data_inlining_row_limit=data_inlining_row_limit,
+    ) as writer:
         snap_id, _sv, _nci, _nfi = writer._get_latest_snapshot()
         table_id = writer._table_exists(table, schema, snap_id)
 
@@ -272,12 +282,14 @@ def delete_ducklake(
     *,
     schema: str = "main",
     data_path: str | Path | None = None,
+    data_inlining_row_limit: int = 0,
 ) -> int:
     """
     Delete rows matching a predicate from a DuckLake table.
 
     Creates Iceberg-compatible position-delete files for each affected
-    data file. If no rows match the predicate, no snapshot is created.
+    Parquet data file. For inlined data, sets ``end_snapshot`` on matching
+    rows. If no rows match the predicate, no snapshot is created.
 
     Parameters
     ----------
@@ -293,6 +305,10 @@ def delete_ducklake(
         Schema name (default: "main").
     data_path
         Override the data path stored in the catalog.
+    data_inlining_row_limit
+        Maximum number of inlined rows. Only affects how the writer
+        instance is configured; deletes on inlined data are handled
+        regardless of this setting.
 
     Returns
     -------
@@ -304,7 +320,11 @@ def delete_ducklake(
     metadata_path = os.fspath(path)
     dp = os.fspath(data_path) if data_path is not None else None
 
-    with DuckLakeCatalogWriter(metadata_path, data_path_override=dp) as writer:
+    with DuckLakeCatalogWriter(
+        metadata_path,
+        data_path_override=dp,
+        data_inlining_row_limit=data_inlining_row_limit,
+    ) as writer:
         return writer.delete_data(predicate, table, schema_name=schema)
 
 
@@ -316,6 +336,7 @@ def update_ducklake(
     *,
     schema: str = "main",
     data_path: str | Path | None = None,
+    data_inlining_row_limit: int = 0,
 ) -> int:
     """
     Update rows matching a predicate in a DuckLake table.
@@ -340,6 +361,9 @@ def update_ducklake(
         Schema name (default: "main").
     data_path
         Override the data path stored in the catalog.
+    data_inlining_row_limit
+        Maximum number of inlined rows. Only affects how the writer
+        instance is configured.
 
     Returns
     -------
@@ -351,7 +375,11 @@ def update_ducklake(
     metadata_path = os.fspath(path)
     dp = os.fspath(data_path) if data_path is not None else None
 
-    with DuckLakeCatalogWriter(metadata_path, data_path_override=dp) as writer:
+    with DuckLakeCatalogWriter(
+        metadata_path,
+        data_path_override=dp,
+        data_inlining_row_limit=data_inlining_row_limit,
+    ) as writer:
         return writer.update_data(updates, predicate, table, schema_name=schema)
 
 
