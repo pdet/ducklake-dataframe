@@ -550,98 +550,63 @@ class DuckLakeCatalogWriter:
         except (ValueError, TypeError):
             return new
 
-    def insert_data(
+    def _build_hive_path(
         self,
-        df: pl.DataFrame,
-        table_name: str,
-        *,
-        schema_name: str = "main",
-    ) -> int:
-        """
-        Insert a DataFrame into an existing table.
+        partition_col_names: list[str],
+        partition_values: list[str],
+    ) -> str:
+        """Build a Hive-style partition path like ``b=x/c=10``."""
+        parts = []
+        for name, val in zip(partition_col_names, partition_values):
+            safe_name = name.replace("=", "%3D")
+            safe_val = str(val).replace("/", "%2F")
+            parts.append(f"{safe_name}={safe_val}")
+        return "/".join(parts)
 
-        Writes a Parquet file and registers it in the catalog with
-        column statistics. Returns the new snapshot ID.
-        """
-        if df.is_empty():
-            msg = "Cannot insert empty DataFrame"
-            raise ValueError(msg)
-
+    def _register_data_file(
+        self,
+        data_file_id: int,
+        table_id: int,
+        new_snap: int,
+        rel_path: str,
+        record_count: int,
+        file_size: int,
+        footer_size: int,
+        row_id_start: int,
+        partition_id: int | None,
+        mapping_id: int,
+    ) -> None:
+        """Register a single data file in the catalog."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
-
-        # Resolve table
-        table_id, table_path, table_path_rel, schema_path, schema_path_rel = (
-            self._get_table_info(table_name, schema_name, snap_id)
-        )
-
-        # Get column definitions
-        columns = self._get_columns_for_table(table_id, snap_id)
-
-        # Build the output directory path
-        base = self.data_path
-        if schema_path_rel:
-            base = os.path.join(base, schema_path)
-        else:
-            base = schema_path
-        if table_path_rel:
-            base = os.path.join(base, table_path)
-        else:
-            base = table_path
-        os.makedirs(base, exist_ok=True)
-
-        # Generate Parquet file name (UUID7)
-        file_name = f"ducklake-{_uuid7()}.parquet"
-        file_path = os.path.join(base, file_name)
-
-        # Write Parquet
-        df.write_parquet(file_path)
-
-        file_size = os.path.getsize(file_path)
-        footer_size = _read_parquet_footer_size(file_path)
-        record_count = len(df)
-
-        # Get current table stats for row_id_start
-        existing_stats = self._get_table_stats(table_id)
-        if existing_stats is not None:
-            row_id_start = existing_stats[1]  # next_row_id
-        else:
-            row_id_start = 0
-
-        # Allocate file ID
-        data_file_id = next_file_id
-        new_next_file_id = next_file_id + 1
-
-        # Create snapshot (schema_version unchanged for DML)
-        new_snap = self._create_snapshot(schema_ver, next_cat_id, new_next_file_id)
-
-        # Register name mapping (Polars doesn't write Parquet field_ids,
-        # so DuckLake needs a map_by_name mapping to resolve columns)
-        mapping_id = self._register_name_mapping(table_id, columns)
-
-        # Register data file
         con.execute(
             "INSERT INTO ducklake_data_file "
             "(data_file_id, table_id, begin_snapshot, end_snapshot, file_order, "
             "path, path_is_relative, file_format, record_count, file_size_bytes, "
             "footer_size, row_id_start, partition_id, encryption_key, "
             "partial_file_info, mapping_id) "
-            "VALUES (?, ?, ?, NULL, NULL, ?, 1, 'parquet', ?, ?, ?, ?, NULL, NULL, NULL, ?)",
+            "VALUES (?, ?, ?, NULL, NULL, ?, 1, 'parquet', ?, ?, ?, ?, ?, NULL, NULL, ?)",
             [
                 data_file_id,
                 table_id,
                 new_snap,
-                file_name,
+                rel_path,
                 record_count,
                 file_size,
                 footer_size,
                 row_id_start,
+                partition_id,
                 mapping_id,
             ],
         )
 
-        # Compute and register per-file column stats
-        col_stats = self._compute_file_column_stats(df, columns)
+    def _register_file_column_stats(
+        self,
+        data_file_id: int,
+        table_id: int,
+        col_stats: list[tuple[int, str, int, int | None, str | None, str | None, int | None]],
+    ) -> None:
+        """Register per-file column statistics."""
+        con = self._connect()
         for col_id, _col_name, value_count, null_count, min_val, max_val, nan_int in col_stats:
             con.execute(
                 "INSERT INTO ducklake_file_column_stats "
@@ -660,10 +625,40 @@ class DuckLakeCatalogWriter:
                 ],
             )
 
-        # Update table stats
-        new_record_count = (existing_stats[0] if existing_stats else 0) + record_count
-        new_next_row_id = row_id_start + record_count
-        new_file_size = (existing_stats[2] if existing_stats else 0) + file_size
+    def _register_partition_values(
+        self,
+        data_file_id: int,
+        table_id: int,
+        partition_key_indices: list[int],
+        partition_values: list[str],
+    ) -> None:
+        """Register partition values for a data file."""
+        con = self._connect()
+        for key_index, val in zip(partition_key_indices, partition_values):
+            con.execute(
+                "INSERT INTO ducklake_file_partition_value "
+                "(data_file_id, table_id, partition_key_index, partition_value) "
+                "VALUES (?, ?, ?, ?)",
+                [data_file_id, table_id, key_index, val],
+            )
+
+    def _update_table_stats(
+        self,
+        table_id: int,
+        added_records: int,
+        added_file_size: int,
+    ) -> None:
+        """Update aggregate table stats after inserting data."""
+        con = self._connect()
+        existing_stats = self._get_table_stats(table_id)
+        if existing_stats is not None:
+            row_id_start = existing_stats[1]
+        else:
+            row_id_start = 0
+
+        new_record_count = (existing_stats[0] if existing_stats else 0) + added_records
+        new_next_row_id = row_id_start + added_records
+        new_file_size = (existing_stats[2] if existing_stats else 0) + added_file_size
 
         if existing_stats is not None:
             con.execute(
@@ -680,7 +675,14 @@ class DuckLakeCatalogWriter:
                 [table_id, new_record_count, new_next_row_id, new_file_size],
             )
 
-        # Update table column stats (aggregate)
+    def _update_table_column_stats(
+        self,
+        table_id: int,
+        columns: list[tuple[int, str, str, int | None]],
+        col_stats: list[tuple[int, str, int, int | None, str | None, str | None, int | None]],
+    ) -> None:
+        """Update aggregate table column stats after inserting data."""
+        con = self._connect()
         for col_id, col_name, _vc, null_count, min_val, max_val, nan_int in col_stats:
             col_type = ""
             for c_id, c_name, c_type, _p in columns:
@@ -698,7 +700,6 @@ class DuckLakeCatalogWriter:
             contains_nan = nan_int if nan_int is not None else None
 
             if existing_col_stat is not None:
-                # Merge
                 merged_null = 1 if (existing_col_stat[0] or contains_null) else 0
                 merged_nan = None
                 if existing_col_stat[1] is not None or contains_nan is not None:
@@ -725,9 +726,200 @@ class DuckLakeCatalogWriter:
                     [table_id, col_id, contains_null, contains_nan, min_val, max_val],
                 )
 
-        # Record change
-        self._record_change(new_snap, f"inserted_into_table:{table_id}")
+    def insert_data(
+        self,
+        df: pl.DataFrame,
+        table_name: str,
+        *,
+        schema_name: str = "main",
+    ) -> int:
+        """
+        Insert a DataFrame into an existing table.
 
+        Writes Parquet file(s) and registers them in the catalog with
+        column statistics. For partitioned tables, writes one file per
+        unique partition value combination using Hive-style directory
+        layout. Returns the new snapshot ID.
+        """
+        if df.is_empty():
+            msg = "Cannot insert empty DataFrame"
+            raise ValueError(msg)
+
+        con = self._connect()
+        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+
+        # Resolve table
+        table_id, table_path, table_path_rel, schema_path, schema_path_rel = (
+            self._get_table_info(table_name, schema_name, snap_id)
+        )
+
+        # Get column definitions
+        columns = self._get_columns_for_table(table_id, snap_id)
+
+        # Build the output directory path
+        base = self.data_path
+        if schema_path_rel:
+            base = os.path.join(base, schema_path)
+        else:
+            base = schema_path
+        if table_path_rel:
+            base = os.path.join(base, table_path)
+        else:
+            base = table_path
+
+        # Check for active partition spec
+        partition_id = self._get_active_partition(table_id, snap_id)
+
+        if partition_id is not None:
+            return self._insert_partitioned(
+                df, table_id, table_name, schema_name,
+                columns, base, partition_id,
+                snap_id, schema_ver, next_cat_id, next_file_id,
+            )
+
+        os.makedirs(base, exist_ok=True)
+
+        # Non-partitioned insert (original logic)
+        file_name = f"ducklake-{_uuid7()}.parquet"
+        file_path = os.path.join(base, file_name)
+        df.write_parquet(file_path)
+
+        file_size = os.path.getsize(file_path)
+        footer_size = _read_parquet_footer_size(file_path)
+        record_count = len(df)
+
+        # Get current table stats for row_id_start
+        existing_stats = self._get_table_stats(table_id)
+        row_id_start = existing_stats[1] if existing_stats is not None else 0
+
+        data_file_id = next_file_id
+        new_next_file_id = next_file_id + 1
+
+        new_snap = self._create_snapshot(schema_ver, next_cat_id, new_next_file_id)
+
+        mapping_id = self._register_name_mapping(table_id, columns)
+
+        self._register_data_file(
+            data_file_id, table_id, new_snap, file_name,
+            record_count, file_size, footer_size, row_id_start,
+            None, mapping_id,
+        )
+
+        col_stats = self._compute_file_column_stats(df, columns)
+        self._register_file_column_stats(data_file_id, table_id, col_stats)
+
+        self._update_table_stats(table_id, record_count, file_size)
+        self._update_table_column_stats(table_id, columns, col_stats)
+
+        self._record_change(new_snap, f"inserted_into_table:{table_id}")
+        con.commit()
+        return new_snap
+
+    def _insert_partitioned(
+        self,
+        df: pl.DataFrame,
+        table_id: int,
+        table_name: str,
+        schema_name: str,
+        columns: list[tuple[int, str, str, int | None]],
+        base_dir: str,
+        partition_id: int,
+        snap_id: int,
+        schema_ver: int,
+        next_cat_id: int,
+        next_file_id: int,
+    ) -> int:
+        """Insert data into a partitioned table, one file per partition group."""
+        con = self._connect()
+
+        # Get partition column definitions
+        part_cols = self._get_partition_columns(partition_id, table_id)
+        col_id_to_name: dict[int, str] = {c[0]: c[1] for c in columns}
+        part_col_names: list[str] = []
+        part_key_indices: list[int] = []
+        for key_index, col_id, transform in part_cols:
+            part_col_names.append(col_id_to_name[col_id])
+            part_key_indices.append(key_index)
+
+        # Group DataFrame by partition columns
+        groups = df.group_by(part_col_names, maintain_order=True)
+        group_list: list[tuple[tuple, pl.DataFrame]] = []
+        for group_key, group_df in groups:
+            if not isinstance(group_key, tuple):
+                group_key = (group_key,)
+            group_list.append((group_key, group_df))
+
+        n_files = len(group_list)
+
+        # Get current table stats for row_id_start
+        existing_stats = self._get_table_stats(table_id)
+        row_id_start = existing_stats[1] if existing_stats is not None else 0
+
+        # Allocate file IDs
+        new_next_file_id = next_file_id + n_files
+
+        # Create snapshot
+        new_snap = self._create_snapshot(schema_ver, next_cat_id, new_next_file_id)
+
+        # Register name mapping once (shared across all partition files)
+        mapping_id = self._register_name_mapping(table_id, columns)
+
+        total_file_size = 0
+        total_records = 0
+        all_col_stats: list[
+            list[tuple[int, str, int, int | None, str | None, str | None, int | None]]
+        ] = []
+
+        current_file_id = next_file_id
+        current_row_id = row_id_start
+
+        for group_key, group_df in group_list:
+            # Build Hive-style partition path
+            partition_values = [str(v) for v in group_key]
+            hive_subdir = self._build_hive_path(part_col_names, partition_values)
+            partition_dir = os.path.join(base_dir, hive_subdir)
+            os.makedirs(partition_dir, exist_ok=True)
+
+            file_name = f"ducklake-{_uuid7()}.parquet"
+            file_path = os.path.join(partition_dir, file_name)
+            group_df.write_parquet(file_path)
+
+            file_size = os.path.getsize(file_path)
+            footer_size = _read_parquet_footer_size(file_path)
+            record_count = len(group_df)
+
+            # Relative path from table dir: hive_subdir/filename
+            rel_path = f"{hive_subdir}/{file_name}"
+
+            self._register_data_file(
+                current_file_id, table_id, new_snap, rel_path,
+                record_count, file_size, footer_size, current_row_id,
+                partition_id, mapping_id,
+            )
+
+            # Register partition values
+            self._register_partition_values(
+                current_file_id, table_id, part_key_indices, partition_values,
+            )
+
+            # Compute and register per-file column stats
+            col_stats = self._compute_file_column_stats(group_df, columns)
+            self._register_file_column_stats(current_file_id, table_id, col_stats)
+            all_col_stats.append(col_stats)
+
+            total_file_size += file_size
+            total_records += record_count
+            current_file_id += 1
+            current_row_id += record_count
+
+        # Update table stats (aggregated across all partition files)
+        self._update_table_stats(table_id, total_records, total_file_size)
+
+        # Update table column stats using the full DataFrame (not per-group)
+        full_col_stats = self._compute_file_column_stats(df, columns)
+        self._update_table_column_stats(table_id, columns, full_col_stats)
+
+        self._record_change(new_snap, f"inserted_into_table:{table_id}")
         con.commit()
         return new_snap
 
@@ -790,6 +982,16 @@ class DuckLakeCatalogWriter:
         os.makedirs(base, exist_ok=True)
 
         record_count = len(df)
+
+        # Check for active partition spec
+        part_id = self._get_active_partition(table_id, snap_id)
+
+        if part_id is not None and record_count > 0:
+            return self._overwrite_partitioned(
+                df, table_id, columns, base, part_id,
+                snap_id, schema_ver, next_cat_id, next_file_id,
+            )
+
         data_file_id = next_file_id
         new_next_file_id = next_file_id + 1 if record_count > 0 else next_file_id
 
@@ -801,7 +1003,6 @@ class DuckLakeCatalogWriter:
         self._end_all_delete_files(table_id, snap_id, new_snap)
 
         if record_count > 0:
-            # Write new Parquet file
             file_name = f"ducklake-{_uuid7()}.parquet"
             file_path = os.path.join(base, file_name)
             df.write_parquet(file_path)
@@ -809,30 +1010,16 @@ class DuckLakeCatalogWriter:
             file_size = os.path.getsize(file_path)
             footer_size = _read_parquet_footer_size(file_path)
 
-            # Register name mapping
             mapping_id = self._register_name_mapping(table_id, columns)
 
-            # Register data file (row_id_start resets to 0)
-            con.execute(
-                "INSERT INTO ducklake_data_file "
-                "(data_file_id, table_id, begin_snapshot, end_snapshot, file_order, "
-                "path, path_is_relative, file_format, record_count, file_size_bytes, "
-                "footer_size, row_id_start, partition_id, encryption_key, "
-                "partial_file_info, mapping_id) "
-                "VALUES (?, ?, ?, NULL, NULL, ?, 1, 'parquet', ?, ?, ?, 0, NULL, NULL, NULL, ?)",
-                [data_file_id, table_id, new_snap, file_name, record_count, file_size, footer_size, mapping_id],
+            self._register_data_file(
+                data_file_id, table_id, new_snap, file_name,
+                record_count, file_size, footer_size, 0,
+                None, mapping_id,
             )
 
-            # Compute and register per-file column stats
             col_stats = self._compute_file_column_stats(df, columns)
-            for col_id, _col_name, value_count, null_count, min_val, max_val, nan_int in col_stats:
-                con.execute(
-                    "INSERT INTO ducklake_file_column_stats "
-                    "(data_file_id, table_id, column_id, column_size_bytes, "
-                    "value_count, null_count, min_value, max_value, contains_nan, extra_stats) "
-                    "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, NULL)",
-                    [data_file_id, table_id, col_id, value_count, null_count, min_val, max_val, nan_int],
-                )
+            self._register_file_column_stats(data_file_id, table_id, col_stats)
 
             # Reset table stats
             existing_stats = self._get_table_stats(table_id)
@@ -878,6 +1065,118 @@ class DuckLakeCatalogWriter:
             con.execute(
                 "DELETE FROM ducklake_table_column_stats WHERE table_id = ?",
                 [table_id],
+            )
+
+        self._record_change(new_snap, f"inserted_into_table:{table_id}")
+        con.commit()
+        return new_snap
+
+    def _overwrite_partitioned(
+        self,
+        df: pl.DataFrame,
+        table_id: int,
+        columns: list[tuple[int, str, str, int | None]],
+        base_dir: str,
+        partition_id: int,
+        snap_id: int,
+        schema_ver: int,
+        next_cat_id: int,
+        next_file_id: int,
+    ) -> int:
+        """Overwrite a partitioned table with new data."""
+        con = self._connect()
+
+        part_cols = self._get_partition_columns(partition_id, table_id)
+        col_id_to_name: dict[int, str] = {c[0]: c[1] for c in columns}
+        part_col_names = [col_id_to_name[col_id] for _, col_id, _ in part_cols]
+        part_key_indices = [key_index for key_index, _, _ in part_cols]
+
+        groups = df.group_by(part_col_names, maintain_order=True)
+        group_list = []
+        for group_key, group_df in groups:
+            if not isinstance(group_key, tuple):
+                group_key = (group_key,)
+            group_list.append((group_key, group_df))
+
+        n_files = len(group_list)
+        new_next_file_id = next_file_id + n_files
+
+        new_snap = self._create_snapshot(schema_ver, next_cat_id, new_next_file_id)
+
+        # End all existing files
+        self._end_all_data_files(table_id, snap_id, new_snap)
+        self._end_all_delete_files(table_id, snap_id, new_snap)
+
+        mapping_id = self._register_name_mapping(table_id, columns)
+
+        total_file_size = 0
+        total_records = 0
+        current_file_id = next_file_id
+        current_row_id = 0
+
+        for group_key, group_df in group_list:
+            partition_values = [str(v) for v in group_key]
+            hive_subdir = self._build_hive_path(part_col_names, partition_values)
+            partition_dir = os.path.join(base_dir, hive_subdir)
+            os.makedirs(partition_dir, exist_ok=True)
+
+            file_name = f"ducklake-{_uuid7()}.parquet"
+            file_path = os.path.join(partition_dir, file_name)
+            group_df.write_parquet(file_path)
+
+            file_size = os.path.getsize(file_path)
+            footer_size = _read_parquet_footer_size(file_path)
+            record_count = len(group_df)
+            rel_path = f"{hive_subdir}/{file_name}"
+
+            self._register_data_file(
+                current_file_id, table_id, new_snap, rel_path,
+                record_count, file_size, footer_size, current_row_id,
+                partition_id, mapping_id,
+            )
+            self._register_partition_values(
+                current_file_id, table_id, part_key_indices, partition_values,
+            )
+
+            col_stats = self._compute_file_column_stats(group_df, columns)
+            self._register_file_column_stats(current_file_id, table_id, col_stats)
+
+            total_file_size += file_size
+            total_records += record_count
+            current_file_id += 1
+            current_row_id += record_count
+
+        # Reset table stats
+        existing_stats = self._get_table_stats(table_id)
+        if existing_stats is not None:
+            con.execute(
+                "UPDATE ducklake_table_stats "
+                "SET record_count = ?, next_row_id = ?, file_size_bytes = ? "
+                "WHERE table_id = ?",
+                [total_records, total_records, total_file_size, table_id],
+            )
+        else:
+            con.execute(
+                "INSERT INTO ducklake_table_stats "
+                "(table_id, record_count, next_row_id, file_size_bytes) "
+                "VALUES (?, ?, ?, ?)",
+                [table_id, total_records, total_records, total_file_size],
+            )
+
+        # Reset table column stats
+        con.execute(
+            "DELETE FROM ducklake_table_column_stats WHERE table_id = ?",
+            [table_id],
+        )
+        full_col_stats = self._compute_file_column_stats(df, columns)
+        for col_id, _col_name, _vc, null_count, min_val, max_val, nan_int in full_col_stats:
+            contains_null = 1 if null_count and null_count > 0 else 0
+            con.execute(
+                "INSERT INTO ducklake_table_column_stats "
+                "(table_id, column_id, contains_null, contains_nan, "
+                "min_value, max_value, extra_stats) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                [table_id, col_id, contains_null, nan_int, min_val, max_val],
             )
 
         self._record_change(new_snap, f"inserted_into_table:{table_id}")
@@ -1117,10 +1416,31 @@ class DuckLakeCatalogWriter:
                 update_exprs.append(pl.lit(value).alias(col_name))
         updated_df = all_matched.with_columns(update_exprs)
 
-        # Allocate file IDs: delete files first, then one data file
+        # Check for active partition spec
+        part_id = self._get_active_partition(table_id, snap_id)
+
+        if part_id is not None:
+            # Partitioned update: write updated rows as partitioned files
+            part_cols = self._get_partition_columns(part_id, table_id)
+            col_id_to_name: dict[int, str] = {c[0]: c[1] for c in columns}
+            part_col_names = [col_id_to_name[col_id] for _, col_id, _ in part_cols]
+            part_key_indices = [key_index for key_index, _, _ in part_cols]
+
+            groups = updated_df.group_by(part_col_names, maintain_order=True)
+            group_list = []
+            for group_key, group_df in groups:
+                if not isinstance(group_key, tuple):
+                    group_key = (group_key,)
+                group_list.append((group_key, group_df))
+
+            n_data_files = len(group_list)
+        else:
+            n_data_files = 1
+
+        # Allocate file IDs: delete files first, then data file(s)
         n_delete_files = len(pending_deletes)
-        new_data_file_id = next_file_id + n_delete_files
-        new_next_file_id = new_data_file_id + 1
+        first_data_file_id = next_file_id + n_delete_files
+        new_next_file_id = first_data_file_id + n_data_files
 
         # Create snapshot
         new_snap = self._create_snapshot(schema_ver, next_cat_id, new_next_file_id)
@@ -1155,14 +1475,6 @@ class DuckLakeCatalogWriter:
                 ],
             )
 
-        # Write new data file with updated rows
-        file_name = f"ducklake-{_uuid7()}.parquet"
-        file_path = os.path.join(base, file_name)
-        updated_df.write_parquet(file_path)
-
-        file_size = os.path.getsize(file_path)
-        footer_size = _read_parquet_footer_size(file_path)
-
         # Row ID start
         existing_stats = self._get_table_stats(table_id)
         row_id_start_new = existing_stats[1] if existing_stats else 0
@@ -1170,98 +1482,69 @@ class DuckLakeCatalogWriter:
         # Register name mapping
         mapping_id = self._register_name_mapping(table_id, columns)
 
-        # Register data file
-        con.execute(
-            "INSERT INTO ducklake_data_file "
-            "(data_file_id, table_id, begin_snapshot, end_snapshot, file_order, "
-            "path, path_is_relative, file_format, record_count, file_size_bytes, "
-            "footer_size, row_id_start, partition_id, encryption_key, "
-            "partial_file_info, mapping_id) "
-            "VALUES (?, ?, ?, NULL, NULL, ?, 1, 'parquet', ?, ?, ?, ?, NULL, NULL, NULL, ?)",
-            [
-                new_data_file_id, table_id, new_snap, file_name,
-                total_updated, file_size, footer_size,
-                row_id_start_new, mapping_id,
-            ],
-        )
+        if part_id is not None:
+            # Write partitioned data files
+            total_file_size = 0
+            current_data_file_id = first_data_file_id
+            current_row_id = row_id_start_new
 
-        # Compute and register per-file column stats
-        col_stats = self._compute_file_column_stats(updated_df, columns)
-        for col_id, _col_name, value_count, null_count, min_val, max_val, nan_int in col_stats:
-            con.execute(
-                "INSERT INTO ducklake_file_column_stats "
-                "(data_file_id, table_id, column_id, column_size_bytes, "
-                "value_count, null_count, min_value, max_value, contains_nan, extra_stats) "
-                "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, NULL)",
-                [
-                    new_data_file_id, table_id, col_id,
-                    value_count, null_count, min_val, max_val, nan_int,
-                ],
+            for group_key, group_df in group_list:
+                partition_values = [str(v) for v in group_key]
+                hive_subdir = self._build_hive_path(part_col_names, partition_values)
+                partition_dir = os.path.join(base, hive_subdir)
+                os.makedirs(partition_dir, exist_ok=True)
+
+                file_name = f"ducklake-{_uuid7()}.parquet"
+                file_path = os.path.join(partition_dir, file_name)
+                group_df.write_parquet(file_path)
+
+                file_size = os.path.getsize(file_path)
+                footer_size = _read_parquet_footer_size(file_path)
+                record_count = len(group_df)
+                rel_path = f"{hive_subdir}/{file_name}"
+
+                self._register_data_file(
+                    current_data_file_id, table_id, new_snap, rel_path,
+                    record_count, file_size, footer_size, current_row_id,
+                    part_id, mapping_id,
+                )
+                self._register_partition_values(
+                    current_data_file_id, table_id, part_key_indices, partition_values,
+                )
+
+                col_stats = self._compute_file_column_stats(group_df, columns)
+                self._register_file_column_stats(current_data_file_id, table_id, col_stats)
+
+                total_file_size += file_size
+                current_data_file_id += 1
+                current_row_id += record_count
+
+            update_file_size = total_file_size
+        else:
+            # Write single non-partitioned data file
+            file_name = f"ducklake-{_uuid7()}.parquet"
+            file_path = os.path.join(base, file_name)
+            updated_df.write_parquet(file_path)
+
+            file_size = os.path.getsize(file_path)
+            footer_size = _read_parquet_footer_size(file_path)
+
+            self._register_data_file(
+                first_data_file_id, table_id, new_snap, file_name,
+                total_updated, file_size, footer_size, row_id_start_new,
+                None, mapping_id,
             )
+
+            col_stats = self._compute_file_column_stats(updated_df, columns)
+            self._register_file_column_stats(first_data_file_id, table_id, col_stats)
+            update_file_size = file_size
 
         # Update table stats
-        new_record_count = (existing_stats[0] if existing_stats else 0) + total_updated
-        new_next_row_id = row_id_start_new + total_updated
-        new_file_size = (existing_stats[2] if existing_stats else 0) + file_size
-
-        if existing_stats is not None:
-            con.execute(
-                "UPDATE ducklake_table_stats "
-                "SET record_count = ?, next_row_id = ?, file_size_bytes = ? "
-                "WHERE table_id = ?",
-                [new_record_count, new_next_row_id, new_file_size, table_id],
-            )
-        else:
-            con.execute(
-                "INSERT INTO ducklake_table_stats "
-                "(table_id, record_count, next_row_id, file_size_bytes) "
-                "VALUES (?, ?, ?, ?)",
-                [table_id, new_record_count, new_next_row_id, new_file_size],
-            )
+        self._update_table_stats(table_id, total_updated, update_file_size)
 
         # Update table column stats
-        for col_id, col_name, _vc, null_count, min_val, max_val, nan_int in col_stats:
-            col_type = ""
-            for c_id, c_name, c_type, _p in columns:
-                if c_id == col_id:
-                    col_type = c_type
-                    break
-
-            existing_col_stat = con.execute(
-                "SELECT contains_null, contains_nan, min_value, max_value "
-                "FROM ducklake_table_column_stats WHERE table_id = ? AND column_id = ?",
-                [table_id, col_id],
-            ).fetchone()
-
-            contains_null = 1 if null_count and null_count > 0 else 0
-            contains_nan = nan_int if nan_int is not None else None
-
-            if existing_col_stat is not None:
-                merged_null = 1 if (existing_col_stat[0] or contains_null) else 0
-                merged_nan = None
-                if existing_col_stat[1] is not None or contains_nan is not None:
-                    merged_nan = 1 if (existing_col_stat[1] or (contains_nan or 0)) else 0
-                merged_min = self._merge_stat_value(
-                    existing_col_stat[2], min_val, col_type, pick_min=True
-                )
-                merged_max = self._merge_stat_value(
-                    existing_col_stat[3], max_val, col_type, pick_min=False
-                )
-                con.execute(
-                    "UPDATE ducklake_table_column_stats "
-                    "SET contains_null = ?, contains_nan = ?, "
-                    "min_value = ?, max_value = ? "
-                    "WHERE table_id = ? AND column_id = ?",
-                    [merged_null, merged_nan, merged_min, merged_max, table_id, col_id],
-                )
-            else:
-                con.execute(
-                    "INSERT INTO ducklake_table_column_stats "
-                    "(table_id, column_id, contains_null, contains_nan, "
-                    "min_value, max_value, extra_stats) "
-                    "VALUES (?, ?, ?, ?, ?, ?, NULL)",
-                    [table_id, col_id, contains_null, contains_nan, min_val, max_val],
-                )
+        full_col_stats = self._compute_file_column_stats(updated_df, columns)
+        self._update_table_column_stats(table_id, columns, full_col_stats)
 
         # Record change: both insert and delete in the same snapshot
         self._record_change(
@@ -1826,6 +2109,111 @@ class DuckLakeCatalogWriter:
 
         # End any descendant columns (for compound types)
         self._end_descendant_columns(table_id, target_col_id, new_snap)
+
+        # Record schema version
+        con.execute(
+            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
+            "VALUES (?, ?)",
+            [new_snap, new_schema_ver],
+        )
+
+        # Record change
+        self._record_change(new_snap, f"altered_table:{table_id}")
+
+        con.commit()
+
+    # ------------------------------------------------------------------
+    # ALTER TABLE: SET PARTITIONED BY
+    # ------------------------------------------------------------------
+
+    def _get_active_partition(
+        self, table_id: int, snapshot_id: int
+    ) -> int | None:
+        """Return the active partition_id for a table, or None."""
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT partition_id FROM ducklake_partition_info "
+                "WHERE table_id = ? AND begin_snapshot <= ? "
+                "AND (end_snapshot IS NULL OR end_snapshot > ?)",
+                [table_id, snapshot_id, snapshot_id],
+            ).fetchone()
+        except Exception:
+            return None
+        return row[0] if row is not None else None
+
+    def _get_partition_columns(
+        self, partition_id: int, table_id: int
+    ) -> list[tuple[int, int, str]]:
+        """Return [(partition_key_index, column_id, transform)]."""
+        con = self._connect()
+        try:
+            rows = con.execute(
+                "SELECT partition_key_index, column_id, transform "
+                "FROM ducklake_partition_column "
+                "WHERE partition_id = ? AND table_id = ? "
+                "ORDER BY partition_key_index",
+                [partition_id, table_id],
+            ).fetchall()
+        except Exception:
+            return []
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    def set_partitioned_by(
+        self,
+        table_name: str,
+        column_names: list[str],
+        *,
+        schema_name: str = "main",
+    ) -> None:
+        """Set identity-transform partitioning on an existing table.
+
+        Equivalent to ``ALTER TABLE t SET PARTITIONED BY (col1, col2, ...)``.
+        Future inserts will write one Parquet file per unique combination
+        of partition column values, using Hive-style directory layout.
+        """
+        con = self._connect()
+        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+
+        table_id = self._table_exists(table_name, schema_name, snap_id)
+        if table_id is None:
+            msg = f"Table '{schema_name}.{table_name}' not found"
+            raise ValueError(msg)
+
+        # Resolve column_ids for the requested partition columns
+        columns = self._get_columns_for_table(table_id, snap_id)
+        col_name_to_id: dict[str, int] = {c[1]: c[0] for c in columns}
+        partition_col_ids: list[int] = []
+        for name in column_names:
+            if name not in col_name_to_id:
+                msg = f"Column '{name}' not found in '{schema_name}.{table_name}'"
+                raise ValueError(msg)
+            partition_col_ids.append(col_name_to_id[name])
+
+        # Allocate partition_id from next_catalog_id
+        partition_id = next_cat_id
+        new_next_cat_id = next_cat_id + 1
+        new_schema_ver = schema_ver + 1
+
+        # Create snapshot
+        new_snap = self._create_snapshot(new_schema_ver, new_next_cat_id, next_file_id)
+
+        # Insert partition_info
+        con.execute(
+            "INSERT INTO ducklake_partition_info "
+            "(partition_id, table_id, begin_snapshot, end_snapshot) "
+            "VALUES (?, ?, ?, NULL)",
+            [partition_id, table_id, new_snap],
+        )
+
+        # Insert partition_column rows
+        for key_index, col_id in enumerate(partition_col_ids):
+            con.execute(
+                "INSERT INTO ducklake_partition_column "
+                "(partition_id, table_id, partition_key_index, column_id, transform) "
+                "VALUES (?, ?, ?, ?, 'identity')",
+                [partition_id, table_id, key_index, col_id],
+            )
 
         # Record schema version
         con.execute(
