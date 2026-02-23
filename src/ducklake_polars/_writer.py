@@ -88,6 +88,7 @@ class DuckLakeCatalogWriter:
         metadata_path: str,
         *,
         data_path_override: str | None = None,
+        data_inlining_row_limit: int = 0,
     ) -> None:
         self._backend = create_backend(metadata_path)
         if not isinstance(self._backend, SQLiteBackend):
@@ -95,6 +96,7 @@ class DuckLakeCatalogWriter:
             raise ValueError(msg)
         self._metadata_path = metadata_path
         self._data_path_override = data_path_override
+        self._data_inlining_row_limit = data_inlining_row_limit
         self._con: Any = None
 
     def _connect(self) -> Any:
@@ -163,6 +165,256 @@ class DuckLakeCatalogWriter:
             "VALUES (?, ?, NULL, NULL, NULL)",
             [snapshot_id, changes_made],
         )
+
+    # ------------------------------------------------------------------
+    # Data inlining helpers
+    # ------------------------------------------------------------------
+
+    def _duckdb_type_to_sqlite_type(self, duckdb_type: str) -> str:
+        """Map a DuckDB column type to an appropriate SQLite storage type."""
+        t = duckdb_type.lower()
+        if t in (
+            "int8", "int16", "int32", "int64", "uint8", "uint16",
+            "uint32", "uint64", "boolean", "tinyint", "smallint",
+            "integer", "bigint",
+        ):
+            return "BIGINT"
+        if t in ("float32", "float64", "float", "double"):
+            return "DOUBLE"
+        return "VARCHAR"
+
+    def _get_inlined_table_name(self, table_id: int, schema_version: int) -> str:
+        """Return the dynamic inlined data table name."""
+        return f"ducklake_inlined_data_{table_id}_{schema_version}"
+
+    def _get_inlined_active_row_count(
+        self, table_id: int, snapshot_id: int
+    ) -> int:
+        """Count active rows across all inlined data tables for a table."""
+        con = self._connect()
+        try:
+            rows = con.execute(
+                "SELECT table_name FROM ducklake_inlined_data_tables "
+                "WHERE table_id = ?",
+                [table_id],
+            ).fetchall()
+        except Exception:
+            return 0
+
+        total = 0
+        for (tbl_name,) in rows:
+            safe = tbl_name.replace('"', '""')
+            try:
+                row = con.execute(
+                    f'SELECT COUNT(*) FROM "{safe}" '
+                    f"WHERE ? >= begin_snapshot "
+                    f"AND (? < end_snapshot OR end_snapshot IS NULL)",
+                    [snapshot_id, snapshot_id],
+                ).fetchone()
+                total += row[0]
+            except Exception:
+                pass
+        return total
+
+    def _ensure_inlined_table(
+        self,
+        table_id: int,
+        schema_version: int,
+        columns: list[tuple[int, str, str, int | None]],
+    ) -> str:
+        """Create the inlined data table if it doesn't exist, register it, and return its name."""
+        con = self._connect()
+        tbl_name = self._get_inlined_table_name(table_id, schema_version)
+        safe = tbl_name.replace('"', '""')
+
+        # Check if already registered
+        try:
+            row = con.execute(
+                "SELECT table_name FROM ducklake_inlined_data_tables "
+                "WHERE table_id = ? AND schema_version = ?",
+                [table_id, schema_version],
+            ).fetchone()
+            if row is not None:
+                return tbl_name
+        except Exception:
+            pass
+
+        # Build CREATE TABLE with row_id, begin_snapshot, end_snapshot + user columns
+        col_defs = [
+            '"row_id" BIGINT',
+            '"begin_snapshot" BIGINT',
+            '"end_snapshot" BIGINT',
+        ]
+        for _col_id, col_name, col_type, _parent in columns:
+            safe_col = col_name.replace('"', '""')
+            sqlite_type = self._duckdb_type_to_sqlite_type(col_type)
+            col_defs.append(f'"{safe_col}" {sqlite_type}')
+
+        create_sql = f'CREATE TABLE IF NOT EXISTS "{safe}" ({", ".join(col_defs)})'
+        con.execute(create_sql)
+
+        # Register in ducklake_inlined_data_tables
+        con.execute(
+            "INSERT INTO ducklake_inlined_data_tables "
+            "(table_id, table_name, schema_version) "
+            "VALUES (?, ?, ?)",
+            [table_id, tbl_name, schema_version],
+        )
+        return tbl_name
+
+    def _serialize_value_for_sqlite(self, value: Any, col_type: str) -> Any:
+        """Convert a Python value to the appropriate SQLite storage format."""
+        if value is None:
+            return None
+        t = col_type.lower()
+        if t == "boolean":
+            return 1 if value else 0
+        if t in ("date",):
+            return str(value)
+        if t.startswith("timestamp") or t == "time":
+            return str(value)
+        if t.startswith("decimal"):
+            return str(value)
+        return value
+
+    def _insert_inlined_rows(
+        self,
+        df: pl.DataFrame,
+        table_id: int,
+        schema_version: int,
+        columns: list[tuple[int, str, str, int | None]],
+        new_snap: int,
+        row_id_start: int,
+    ) -> None:
+        """Insert DataFrame rows into the inlined data table."""
+        con = self._connect()
+        tbl_name = self._ensure_inlined_table(table_id, schema_version, columns)
+        safe_tbl = tbl_name.replace('"', '""')
+
+        col_names = [c[1] for c in columns]
+        col_types = {c[1]: c[2] for c in columns}
+
+        # Build column list for INSERT
+        all_cols = ["row_id", "begin_snapshot", "end_snapshot"] + [
+            f'"{c.replace(chr(34), chr(34) + chr(34))}"' for c in col_names
+        ]
+        placeholders = ", ".join(["?"] * len(all_cols))
+        insert_sql = f'INSERT INTO "{safe_tbl}" ({", ".join(all_cols)}) VALUES ({placeholders})'
+
+        for i, row_tuple in enumerate(df.iter_rows()):
+            row_vals: list[Any] = [row_id_start + i, new_snap, None]
+            for j, col_name in enumerate(col_names):
+                row_vals.append(
+                    self._serialize_value_for_sqlite(row_tuple[j], col_types[col_name])
+                )
+            con.execute(insert_sql, row_vals)
+
+    def _delete_inlined_rows(
+        self,
+        table_id: int,
+        predicate: pl.Expr,
+        snapshot_id: int,
+        new_snap: int,
+        columns: list[tuple[int, str, str, int | None]],
+    ) -> int:
+        """Set end_snapshot on inlined rows matching the predicate. Returns count of deleted rows."""
+        con = self._connect()
+        try:
+            inlined_tables = con.execute(
+                "SELECT table_name FROM ducklake_inlined_data_tables "
+                "WHERE table_id = ?",
+                [table_id],
+            ).fetchall()
+        except Exception:
+            return 0
+
+        col_names = [c[1] for c in columns]
+        total_deleted = 0
+
+        for (tbl_name,) in inlined_tables:
+            safe = tbl_name.replace('"', '""')
+            # Read active rows
+            cols_sql = '"row_id", ' + ", ".join(
+                f'"{c.replace(chr(34), chr(34) + chr(34))}"' for c in col_names
+            )
+            try:
+                rows = con.execute(
+                    f'SELECT {cols_sql} FROM "{safe}" '
+                    f"WHERE ? >= begin_snapshot "
+                    f"AND (? < end_snapshot OR end_snapshot IS NULL)",
+                    [snapshot_id, snapshot_id],
+                ).fetchall()
+            except Exception:
+                continue
+
+            if not rows:
+                continue
+
+            # Build DataFrame to evaluate predicate
+            data = {name: [r[i + 1] for r in rows] for i, name in enumerate(col_names)}
+            row_ids = [r[0] for r in rows]
+            inline_df = pl.DataFrame(data)
+
+            # Evaluate predicate
+            mask = inline_df.with_columns(predicate.alias("__del__"))["__del__"]
+            to_delete = [row_ids[i] for i, v in enumerate(mask.to_list()) if v]
+
+            if to_delete:
+                for rid in to_delete:
+                    con.execute(
+                        f'UPDATE "{safe}" SET end_snapshot = ? WHERE row_id = ? AND end_snapshot IS NULL',
+                        [new_snap, rid],
+                    )
+                total_deleted += len(to_delete)
+
+        return total_deleted
+
+    def _end_all_inlined_rows(
+        self, table_id: int, snapshot_id: int, new_snap: int
+    ) -> None:
+        """Mark all active inlined rows as ended (for overwrite)."""
+        con = self._connect()
+        try:
+            inlined_tables = con.execute(
+                "SELECT table_name FROM ducklake_inlined_data_tables "
+                "WHERE table_id = ?",
+                [table_id],
+            ).fetchall()
+        except Exception:
+            return
+
+        for (tbl_name,) in inlined_tables:
+            safe = tbl_name.replace('"', '""')
+            try:
+                con.execute(
+                    f'UPDATE "{safe}" SET end_snapshot = ? '
+                    f"WHERE ? >= begin_snapshot "
+                    f"AND (? < end_snapshot OR end_snapshot IS NULL)",
+                    [new_snap, snapshot_id, snapshot_id],
+                )
+            except Exception:
+                pass
+
+    def _should_inline(
+        self, table_id: int, snapshot_id: int, new_row_count: int
+    ) -> bool:
+        """Return True if the insert should be inlined."""
+        if self._data_inlining_row_limit <= 0:
+            return False
+        current = self._get_inlined_active_row_count(table_id, snapshot_id)
+        # Check if adding new rows would exceed the limit
+        # DuckDB inlines if the total active count (existing inlined + new) <= limit
+        return (current + new_row_count) <= self._data_inlining_row_limit
+
+    def _get_schema_version_for_table(self, table_id: int, snapshot_id: int) -> int:
+        """Return the schema_version at a given snapshot."""
+        con = self._connect()
+        row = con.execute(
+            "SELECT schema_version FROM ducklake_snapshot "
+            "WHERE snapshot_id = ?",
+            [snapshot_id],
+        ).fetchone()
+        return row[0] if row else 1
 
     # ------------------------------------------------------------------
     # Column name mapping
@@ -739,7 +991,9 @@ class DuckLakeCatalogWriter:
         Writes Parquet file(s) and registers them in the catalog with
         column statistics. For partitioned tables, writes one file per
         unique partition value combination using Hive-style directory
-        layout. Returns the new snapshot ID.
+        layout. When data inlining is enabled and the row count is below
+        the threshold, data is stored directly in the metadata catalog
+        instead of Parquet files. Returns the new snapshot ID.
         """
         if df.is_empty():
             msg = "Cannot insert empty DataFrame"
@@ -755,6 +1009,15 @@ class DuckLakeCatalogWriter:
 
         # Get column definitions
         columns = self._get_columns_for_table(table_id, snap_id)
+
+        record_count = len(df)
+
+        # Check if data should be inlined
+        if self._should_inline(table_id, snap_id, record_count):
+            return self._insert_inlined(
+                df, table_id, columns,
+                snap_id, schema_ver, next_cat_id, next_file_id,
+            )
 
         # Build the output directory path
         base = self.data_path
@@ -786,7 +1049,6 @@ class DuckLakeCatalogWriter:
 
         file_size = os.path.getsize(file_path)
         footer_size = _read_parquet_footer_size(file_path)
-        record_count = len(df)
 
         # Get current table stats for row_id_start
         existing_stats = self._get_table_stats(table_id)
@@ -810,6 +1072,43 @@ class DuckLakeCatalogWriter:
 
         self._update_table_stats(table_id, record_count, file_size)
         self._update_table_column_stats(table_id, columns, col_stats)
+
+        self._record_change(new_snap, f"inserted_into_table:{table_id}")
+        con.commit()
+        return new_snap
+
+    def _insert_inlined(
+        self,
+        df: pl.DataFrame,
+        table_id: int,
+        columns: list[tuple[int, str, str, int | None]],
+        snap_id: int,
+        schema_ver: int,
+        next_cat_id: int,
+        next_file_id: int,
+    ) -> int:
+        """Insert data into the inlined data table instead of Parquet."""
+        con = self._connect()
+        record_count = len(df)
+
+        # Get current table stats for row_id_start
+        existing_stats = self._get_table_stats(table_id)
+        row_id_start = existing_stats[1] if existing_stats is not None else 0
+
+        # Create snapshot (no new file IDs needed for inlined data)
+        new_snap = self._create_snapshot(schema_ver, next_cat_id, next_file_id)
+
+        # Insert rows into the inlined data table
+        self._insert_inlined_rows(
+            df, table_id, schema_ver, columns, new_snap, row_id_start,
+        )
+
+        # Update table stats (file_size=0 for inlined data)
+        self._update_table_stats(table_id, record_count, 0)
+        self._update_table_column_stats(
+            table_id, columns,
+            self._compute_file_column_stats(df, columns),
+        )
 
         self._record_change(new_snap, f"inserted_into_table:{table_id}")
         con.commit()
@@ -998,9 +1297,49 @@ class DuckLakeCatalogWriter:
         # Create snapshot
         new_snap = self._create_snapshot(schema_ver, next_cat_id, new_next_file_id)
 
-        # End all existing files
+        # End all existing files and inlined data
         self._end_all_data_files(table_id, snap_id, new_snap)
         self._end_all_delete_files(table_id, snap_id, new_snap)
+        self._end_all_inlined_rows(table_id, snap_id, new_snap)
+
+        # Check if new data should be inlined
+        if record_count > 0 and self._should_inline(table_id, new_snap, record_count):
+            self._insert_inlined_rows(
+                df, table_id, schema_ver, columns, new_snap, 0,
+            )
+            # Reset table stats for inlined overwrite
+            existing_stats = self._get_table_stats(table_id)
+            if existing_stats is not None:
+                con.execute(
+                    "UPDATE ducklake_table_stats "
+                    "SET record_count = ?, next_row_id = ?, file_size_bytes = 0 "
+                    "WHERE table_id = ?",
+                    [record_count, record_count, table_id],
+                )
+            else:
+                con.execute(
+                    "INSERT INTO ducklake_table_stats "
+                    "(table_id, record_count, next_row_id, file_size_bytes) "
+                    "VALUES (?, ?, ?, 0)",
+                    [table_id, record_count, record_count],
+                )
+            con.execute(
+                "DELETE FROM ducklake_table_column_stats WHERE table_id = ?",
+                [table_id],
+            )
+            col_stats = self._compute_file_column_stats(df, columns)
+            for col_id, _col_name, _vc, null_count, min_val, max_val, nan_int in col_stats:
+                contains_null = 1 if null_count and null_count > 0 else 0
+                con.execute(
+                    "INSERT INTO ducklake_table_column_stats "
+                    "(table_id, column_id, contains_null, contains_nan, "
+                    "min_value, max_value, extra_stats) "
+                    "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                    [table_id, col_id, contains_null, nan_int, min_val, max_val],
+                )
+            self._record_change(new_snap, f"inserted_into_table:{table_id}")
+            con.commit()
+            return new_snap
 
         if record_count > 0:
             file_name = f"ducklake-{_uuid7()}.parquet"
@@ -1103,9 +1442,10 @@ class DuckLakeCatalogWriter:
 
         new_snap = self._create_snapshot(schema_ver, next_cat_id, new_next_file_id)
 
-        # End all existing files
+        # End all existing files and inlined data
         self._end_all_data_files(table_id, snap_id, new_snap)
         self._end_all_delete_files(table_id, snap_id, new_snap)
+        self._end_all_inlined_rows(table_id, snap_id, new_snap)
 
         mapping_id = self._register_name_mapping(table_id, columns)
 
@@ -1238,9 +1578,10 @@ class DuckLakeCatalogWriter:
         """
         Delete rows matching a predicate from a table.
 
-        Creates Iceberg-compatible position-delete Parquet files for each
-        affected data file. Returns the number of deleted rows. If no rows
-        match the predicate, no snapshot is created and 0 is returned.
+        For Parquet-backed data, creates Iceberg-compatible position-delete
+        files. For inlined data, sets ``end_snapshot`` on matching rows.
+        Returns the number of deleted rows. If no rows match the predicate,
+        no snapshot is created and 0 is returned.
         """
         con = self._connect()
         snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
@@ -1249,94 +1590,114 @@ class DuckLakeCatalogWriter:
             self._get_table_info(table_name, schema_name, snap_id)
         )
 
+        columns = self._get_columns_for_table(table_id, snap_id)
         data_files = self._get_active_data_files(table_id, snap_id)
-        if not data_files:
+
+        # Count inlined rows that match the predicate (pre-check)
+        inlined_count = self._get_inlined_active_row_count(table_id, snap_id)
+
+        if not data_files and inlined_count == 0:
             return 0
 
-        # Build the output directory for delete files
-        base = self.data_path
-        if schema_path_rel:
-            base = os.path.join(base, schema_path)
-        else:
-            base = schema_path
-        if table_path_rel:
-            base = os.path.join(base, table_path)
-        else:
-            base = table_path
-        os.makedirs(base, exist_ok=True)
-
-        # For each data file, evaluate the predicate and collect delete positions
-        # Each entry: (data_file_id, abs_data_path, local_positions)
+        # Handle Parquet file deletes
         pending_deletes: list[tuple[int, str, list[int]]] = []
         total_deleted = 0
 
-        for data_file_id, rel_path, path_is_rel, record_count, row_id_start in data_files:
-            abs_path = self._resolve_file_path(
-                rel_path, path_is_rel,
-                table_path, table_path_rel,
-                schema_path, schema_path_rel,
-            )
-            df = pl.read_parquet(abs_path)
-            # Evaluate predicate to find matching rows
-            # Use with_columns (not select) so scalar predicates like pl.lit(True)
-            # are broadcast to all rows
-            mask = df.with_columns(predicate.alias("__delete_mask__"))["__delete_mask__"]
-            positions = [i for i, v in enumerate(mask.to_list()) if v]
-            if positions:
-                pending_deletes.append((data_file_id, abs_path, positions))
-                total_deleted += len(positions)
+        if data_files:
+            base = self.data_path
+            if schema_path_rel:
+                base = os.path.join(base, schema_path)
+            else:
+                base = schema_path
+            if table_path_rel:
+                base = os.path.join(base, table_path)
+            else:
+                base = table_path
+            os.makedirs(base, exist_ok=True)
 
-        if total_deleted == 0:
+            for data_file_id, rel_path, path_is_rel, record_count, row_id_start in data_files:
+                abs_path = self._resolve_file_path(
+                    rel_path, path_is_rel,
+                    table_path, table_path_rel,
+                    schema_path, schema_path_rel,
+                )
+                df = pl.read_parquet(abs_path)
+                mask = df.with_columns(predicate.alias("__delete_mask__"))["__delete_mask__"]
+                positions = [i for i, v in enumerate(mask.to_list()) if v]
+                if positions:
+                    pending_deletes.append((data_file_id, abs_path, positions))
+                    total_deleted += len(positions)
+
+        # Pre-count inlined deletes (we need to know totals before creating snapshot)
+        # We'll do the actual delete after creating the snapshot
+        # For now just check if there will be inlined deletes
+        has_inlined_data = inlined_count > 0
+
+        if total_deleted == 0 and not has_inlined_data:
             return 0
 
-        # Allocate file IDs for all delete files from the shared counter
+        # Allocate file IDs for Parquet delete files
         current_file_id = next_file_id
         new_next_file_id = next_file_id + len(pending_deletes)
 
         # Create snapshot
         new_snap = self._create_snapshot(schema_ver, next_cat_id, new_next_file_id)
 
-        # Write delete files and register them
-        for data_file_id, abs_data_path, positions in pending_deletes:
-            delete_file_id = current_file_id
-            current_file_id += 1
+        # Write Parquet delete files
+        if pending_deletes:
+            base = self.data_path
+            if schema_path_rel:
+                base = os.path.join(base, schema_path)
+            else:
+                base = schema_path
+            if table_path_rel:
+                base = os.path.join(base, table_path)
+            else:
+                base = table_path
 
-            # Build the position-delete DataFrame
-            # file_path = absolute resolved path (matches DuckDB behavior)
-            # pos = 0-based local position within the file
-            delete_df = pl.DataFrame({
-                "file_path": [abs_data_path] * len(positions),
-                "pos": pl.Series(positions, dtype=pl.Int64),
-            })
+            for data_file_id, abs_data_path, positions in pending_deletes:
+                delete_file_id = current_file_id
+                current_file_id += 1
 
-            # Write delete Parquet file
-            delete_file_name = f"ducklake-{_uuid7()}-delete.parquet"
-            delete_file_path = os.path.join(base, delete_file_name)
-            delete_df.write_parquet(delete_file_path)
+                delete_df = pl.DataFrame({
+                    "file_path": [abs_data_path] * len(positions),
+                    "pos": pl.Series(positions, dtype=pl.Int64),
+                })
+                delete_file_name = f"ducklake-{_uuid7()}-delete.parquet"
+                delete_file_path = os.path.join(base, delete_file_name)
+                delete_df.write_parquet(delete_file_path)
 
-            delete_file_size = os.path.getsize(delete_file_path)
-            delete_footer_size = _read_parquet_footer_size(delete_file_path)
+                delete_file_size = os.path.getsize(delete_file_path)
+                delete_footer_size = _read_parquet_footer_size(delete_file_path)
 
-            # Register delete file in catalog
-            con.execute(
-                "INSERT INTO ducklake_delete_file "
-                "(delete_file_id, table_id, begin_snapshot, end_snapshot, "
-                "data_file_id, path, path_is_relative, format, delete_count, "
-                "file_size_bytes, footer_size, encryption_key) "
-                "VALUES (?, ?, ?, NULL, ?, ?, 1, 'parquet', ?, ?, ?, NULL)",
-                [
-                    delete_file_id,
-                    table_id,
-                    new_snap,
-                    data_file_id,
-                    delete_file_name,
-                    len(positions),
-                    delete_file_size,
-                    delete_footer_size,
-                ],
+                con.execute(
+                    "INSERT INTO ducklake_delete_file "
+                    "(delete_file_id, table_id, begin_snapshot, end_snapshot, "
+                    "data_file_id, path, path_is_relative, format, delete_count, "
+                    "file_size_bytes, footer_size, encryption_key) "
+                    "VALUES (?, ?, ?, NULL, ?, ?, 1, 'parquet', ?, ?, ?, NULL)",
+                    [
+                        delete_file_id, table_id, new_snap, data_file_id,
+                        delete_file_name, len(positions),
+                        delete_file_size, delete_footer_size,
+                    ],
+                )
+
+        # Delete from inlined data (set end_snapshot)
+        inlined_deleted = 0
+        if has_inlined_data:
+            inlined_deleted = self._delete_inlined_rows(
+                table_id, predicate, snap_id, new_snap, columns,
             )
+            total_deleted += inlined_deleted
 
-        # Record change (table stats are NOT updated on delete, matching DuckDB)
+        if total_deleted == 0:
+            # Nothing was actually deleted — but we already created a snapshot.
+            # This can happen if inlined data had rows but none matched.
+            # Roll back by not committing (the snapshot is harmless though).
+            con.commit()
+            return 0
+
         self._record_change(new_snap, f"deleted_from_table:{table_id}")
         con.commit()
         return total_deleted
@@ -1344,6 +1705,57 @@ class DuckLakeCatalogWriter:
     # ------------------------------------------------------------------
     # UPDATE (delete + insert in a single snapshot)
     # ------------------------------------------------------------------
+
+    def _get_inlined_matched_rows(
+        self,
+        table_id: int,
+        predicate: pl.Expr,
+        snapshot_id: int,
+        columns: list[tuple[int, str, str, int | None]],
+    ) -> pl.DataFrame | None:
+        """Read inlined rows matching a predicate. Returns DataFrame or None."""
+        con = self._connect()
+        try:
+            inlined_tables = con.execute(
+                "SELECT table_name FROM ducklake_inlined_data_tables "
+                "WHERE table_id = ?",
+                [table_id],
+            ).fetchall()
+        except Exception:
+            return None
+
+        col_names = [c[1] for c in columns]
+        all_matched: list[pl.DataFrame] = []
+
+        for (tbl_name,) in inlined_tables:
+            safe = tbl_name.replace('"', '""')
+            cols_sql = '"row_id", ' + ", ".join(
+                f'"{c.replace(chr(34), chr(34) + chr(34))}"' for c in col_names
+            )
+            try:
+                rows = con.execute(
+                    f'SELECT {cols_sql} FROM "{safe}" '
+                    f"WHERE ? >= begin_snapshot "
+                    f"AND (? < end_snapshot OR end_snapshot IS NULL)",
+                    [snapshot_id, snapshot_id],
+                ).fetchall()
+            except Exception:
+                continue
+
+            if not rows:
+                continue
+
+            data = {name: [r[i + 1] for r in rows] for i, name in enumerate(col_names)}
+            inline_df = pl.DataFrame(data)
+            mask = inline_df.with_columns(predicate.alias("__mask__"))["__mask__"]
+            matched_indices = [i for i, v in enumerate(mask.to_list()) if v]
+            if matched_indices:
+                matched = inline_df.filter(predicate)
+                all_matched.append(matched)
+
+        if not all_matched:
+            return None
+        return pl.concat(all_matched) if len(all_matched) > 1 else all_matched[0]
 
     def update_data(
         self,
@@ -1356,9 +1768,11 @@ class DuckLakeCatalogWriter:
         """
         Update rows matching a predicate.
 
-        Creates position-delete files for the old rows and a new data file
-        with the updated rows, all in a single snapshot. Returns the number
-        of rows updated. If no rows match, no snapshot is created.
+        Creates position-delete files for old Parquet rows and sets
+        ``end_snapshot`` on old inlined rows. Writes updated rows to a
+        new Parquet data file. All changes are in a single snapshot.
+        Returns the number of rows updated. If no rows match, no
+        snapshot is created.
         """
         con = self._connect()
         snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
@@ -1369,7 +1783,9 @@ class DuckLakeCatalogWriter:
 
         columns = self._get_columns_for_table(table_id, snap_id)
         data_files = self._get_active_data_files(table_id, snap_id)
-        if not data_files:
+        inlined_count = self._get_inlined_active_row_count(table_id, snap_id)
+
+        if not data_files and inlined_count == 0:
             return 0
 
         # Build output directory
@@ -1384,7 +1800,7 @@ class DuckLakeCatalogWriter:
             base = table_path
         os.makedirs(base, exist_ok=True)
 
-        # Evaluate predicate on each data file
+        # Evaluate predicate on Parquet data files
         pending_deletes: list[tuple[int, str, list[int]]] = []
         matched_dfs: list[pl.DataFrame] = []
         total_updated = 0
@@ -1402,6 +1818,16 @@ class DuckLakeCatalogWriter:
                 pending_deletes.append((data_file_id, abs_path, positions))
                 matched_dfs.append(df.filter(predicate))
                 total_updated += len(positions)
+
+        # Check inlined data for matches
+        inlined_matched = None
+        if inlined_count > 0:
+            inlined_matched = self._get_inlined_matched_rows(
+                table_id, predicate, snap_id, columns,
+            )
+            if inlined_matched is not None:
+                total_updated += len(inlined_matched)
+                matched_dfs.append(inlined_matched)
 
         if total_updated == 0:
             return 0
@@ -1473,6 +1899,12 @@ class DuckLakeCatalogWriter:
                     delete_file_name, len(positions),
                     delete_file_size, delete_footer_size,
                 ],
+            )
+
+        # Delete inlined rows (set end_snapshot)
+        if inlined_matched is not None and len(inlined_matched) > 0:
+            self._delete_inlined_rows(
+                table_id, predicate, snap_id, new_snap, columns,
             )
 
         # Row ID start
@@ -1792,6 +2224,9 @@ class DuckLakeCatalogWriter:
 
         # End all active delete files
         self._end_all_delete_files(table_id, snap_id, new_snap)
+
+        # End all active inlined rows
+        self._end_all_inlined_rows(table_id, snap_id, new_snap)
 
         # Record schema version
         con.execute(

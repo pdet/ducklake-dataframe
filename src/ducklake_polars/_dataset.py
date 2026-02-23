@@ -39,6 +39,38 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
+def _cast_inlined_to_schema(
+    df: pl.DataFrame, schema: dict[str, pl.DataType]
+) -> pl.DataFrame:
+    """Cast inlined data from SQLite types to the catalog schema.
+
+    SQLite stores all integers as BIGINT (Int64), booleans as 0/1 integers,
+    dates/timestamps as strings, and decimals as strings.  This function
+    casts each column to the expected Polars type so the temp Parquet file
+    matches the dataset schema reported by ``schema()``.
+    """
+    cast_exprs: list[pl.Expr] = []
+    for col_name in df.columns:
+        if col_name not in schema:
+            cast_exprs.append(pl.col(col_name))
+            continue
+        target = schema[col_name]
+        current = df[col_name].dtype
+        if current == target:
+            cast_exprs.append(pl.col(col_name))
+        elif isinstance(target, pl.Boolean) and current in (pl.Int64, pl.Int32, pl.Int8):
+            cast_exprs.append(pl.col(col_name).cast(pl.Boolean))
+        elif isinstance(target, pl.Datetime):
+            # DuckDB writes all timestamps as microseconds in Parquet
+            cast_exprs.append(pl.col(col_name).cast(pl.Datetime("us")))
+        else:
+            try:
+                cast_exprs.append(pl.col(col_name).cast(target))
+            except Exception:
+                cast_exprs.append(pl.col(col_name))
+    return df.select(cast_exprs)
+
+
 def _is_active_at(entry: ColumnHistoryEntry, snapshot: int) -> bool:
     """Check if a column history entry was active at a given snapshot."""
     return entry.begin_snapshot <= snapshot and (
@@ -474,7 +506,22 @@ class DuckLakeDataset:
                     column_names,
                 )
                 if inlined is not None and not inlined.is_empty():
-                    return inlined.lazy(), version_key
+                    # The dataset scan resolver only accepts bare Parquet
+                    # SCAN nodes; df.lazy() is a DF node which is rejected.
+                    # Write inlined data to a temp Parquet file.
+                    # Cast to the catalog schema first — SQLite stores all
+                    # ints as Int64, dates as strings, etc.
+                    schema_dict = self._build_schema_from_columns(all_columns)
+                    inlined = _cast_inlined_to_schema(inlined, schema_dict)
+                    fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+                    os.close(fd)
+                    atexit.register(lambda p=tmp_path: _safe_unlink(p))
+                    inlined.write_parquet(tmp_path)
+                    return scan_parquet(
+                        tmp_path,
+                        missing_columns="insert",
+                        extra_columns="ignore",
+                    ), version_key
                 # Empty table - return scan_parquet with empty list
                 schema_dict = self._build_schema_from_columns(all_columns)
                 return scan_parquet(
@@ -630,13 +677,29 @@ class DuckLakeDataset:
                     ),
                 )
 
-            # If there's inlined data, we need to combine it
+            # If there's inlined data, combine via temp file (the scan
+            # resolver only accepts bare Parquet SCAN nodes, so we must
+            # collect the Parquet scan, append inlined rows, and write
+            # everything to a single temp file).
             inlined = reader.read_inlined_data(
                 table.table_id,
                 snapshot.snapshot_id,
                 column_names,
             )
             if inlined is not None and not inlined.is_empty():
-                lf = pl.concat([lf, inlined.lazy()], how="diagonal_relaxed")
+                schema_dict = self._build_schema_from_columns(all_columns)
+                inlined = _cast_inlined_to_schema(inlined, schema_dict)
+                combined = pl.concat(
+                    [lf.collect(), inlined], how="diagonal_relaxed"
+                )
+                fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+                os.close(fd)
+                atexit.register(lambda p=tmp_path: _safe_unlink(p))
+                combined.write_parquet(tmp_path)
+                lf = scan_parquet(
+                    tmp_path,
+                    missing_columns="insert",
+                    extra_columns="ignore",
+                )
 
             return lf, version_key
