@@ -38,6 +38,7 @@ Issues = "https://github.com/pdet/ducklake-polars/issues"
 
 [project.optional-dependencies]
 postgres = ["psycopg2-binary>=2.9"]
+pandas = ["pandas>=1.5", "pyarrow>=10.0"]
 dev = [
     "pytest>=7.0",
     "pytest-xdist",
@@ -45,7 +46,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ducklake_polars"]
+packages = ["src/ducklake_polars", "src/ducklake_pandas"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
