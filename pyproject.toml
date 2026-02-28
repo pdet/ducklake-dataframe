@@ -49,7 +49,7 @@ dev = [
 packages = ["src/ducklake_polars", "src/ducklake_pandas"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "tests_pandas"]
 markers = [
     "postgres: PostgreSQL integration tests (require DUCKLAKE_PG_DSN env var)",
 ]

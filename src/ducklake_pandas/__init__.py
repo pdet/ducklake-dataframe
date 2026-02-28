@@ -85,11 +85,30 @@ def read_ducklake(
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from ducklake_core._catalog import DuckLakeCatalogReader
+    from ducklake_core._catalog import DuckLakeCatalogReader, ColumnHistoryEntry
     from ducklake_core._schema import resolve_column_type
 
     metadata_path = os.fspath(path)
     dp = os.fspath(data_path) if data_path is not None else None
+
+    def _is_active_at(entry: ColumnHistoryEntry, snapshot: int) -> bool:
+        """Check if a column history entry was active at a given snapshot."""
+        return entry.begin_snapshot <= snapshot and (
+            entry.end_snapshot is None or entry.end_snapshot > snapshot
+        )
+
+    def _get_physical_name(
+        column_id: int,
+        file_begin_snapshot: int,
+        history: list[ColumnHistoryEntry],
+    ) -> str | None:
+        """Get the physical column name that was active when the file was written."""
+        for entry in history:
+            if entry.column_id != column_id:
+                continue
+            if _is_active_at(entry, file_begin_snapshot):
+                return entry.column_name
+        return None
 
     with DuckLakeCatalogReader(metadata_path, data_path_override=dp) as reader:
         # Resolve snapshot
@@ -104,6 +123,12 @@ def read_ducklake(
         all_columns = reader.get_all_columns(table_info.table_id, snap.snapshot_id)
         top_columns = [c for c in all_columns if c.parent_column is None]
         column_names = [c.column_name for c in top_columns]
+        # Map column_id -> column_name for current schema (used for field_id matching)
+        col_id_to_name: dict[int, str] = {c.column_id: c.column_name for c in top_columns}
+
+        # Get column history for rename detection
+        column_history = reader.get_column_history(table_info.table_id)
+        top_history = [e for e in column_history if e.parent_column is None]
 
         # Build Arrow schema for empty table creation
         arrow_fields = []
@@ -126,7 +151,7 @@ def read_ducklake(
 
         for f in data_files:
             file_path = reader.resolve_data_file_path(f.path, f.path_is_relative, table_info)
-            tbl = pq.read_table(file_path)
+            tbl = pq.ParquetFile(file_path).read()
 
             # Apply delete files (Iceberg position-delete format)
             if f.data_file_id in del_map:
@@ -135,9 +160,8 @@ def read_ducklake(
                     del_tbl = pq.read_table(del_path)
                     if "pos" in del_tbl.column_names:
                         positions = del_tbl.column("pos").to_pylist()
-                        local_positions = [p - f.row_id_start for p in positions]
                         all_positions.extend(
-                            p for p in local_positions if 0 <= p < tbl.num_rows
+                            p for p in positions if 0 <= p < tbl.num_rows
                         )
                 if all_positions:
                     # Create mask: True = keep, then filter
@@ -146,9 +170,126 @@ def read_ducklake(
                         keep[p] = False
                     tbl = tbl.filter(pa.array(keep, type=pa.bool_()))
 
-            # Select only columns present in the current schema
-            available = [c for c in column_names if c in tbl.column_names]
-            tbl = tbl.select(available)
+            # Build column mapping: try field_id first, fall back to name
+            file_field_map: dict[int, int] = {}
+            file_schema = tbl.schema
+            for i in range(len(file_schema)):
+                field = file_schema.field(i)
+                if field.metadata and b"PARQUET:field_id" in field.metadata:
+                    fid = int(field.metadata[b"PARQUET:field_id"])
+                    file_field_map[fid] = i
+
+            # Also build name → index map for fallback (map_by_name)
+            file_name_map: dict[str, int] = {
+                file_schema.field(i).name: i for i in range(len(file_schema))
+            }
+
+            # Build rename map: {physical_name -> current_name} using column history
+            # This handles the case where a column was renamed after the file was written
+            current_ids = {c.column_id for c in top_columns}
+            current_name_set = {c.column_name for c in top_columns}
+            rename_map: dict[str, str] = {}
+            for col in top_columns:
+                physical = _get_physical_name(col.column_id, f.begin_snapshot, top_history)
+                if physical is not None and physical != col.column_name:
+                    rename_map[physical] = col.column_name
+            # Handle dropped column name conflicts: a dropped column's physical name
+            # collides with a new column's name (different column_id, same name)
+            for entry in top_history:
+                if entry.column_id in current_ids:
+                    continue  # Not dropped
+                if _is_active_at(entry, f.begin_snapshot):
+                    if entry.column_name in current_name_set and entry.column_name not in rename_map:
+                        rename_map[entry.column_name] = f"__ducklake_dropped_{entry.column_id}__"
+
+            # Handle struct field renames
+            struct_field_renames: dict[str, list[str]] = {}
+            child_history = [e for e in column_history if e.parent_column is not None]
+            if child_history:
+                struct_cols = {
+                    c.column_id: c
+                    for c in all_columns
+                    if c.column_type == "struct" and c.parent_column is None
+                }
+                for struct_id, struct_col in struct_cols.items():
+                    current_children = sorted(
+                        [c for c in all_columns if c.parent_column == struct_id],
+                        key=lambda c: c.column_order,
+                    )
+                    physical_children = sorted(
+                        [e for e in child_history
+                         if e.parent_column == struct_id
+                         and _is_active_at(e, f.begin_snapshot)],
+                        key=lambda e: e.column_order,
+                    )
+                    if len(current_children) != len(physical_children):
+                        continue
+                    physical_names = [e.column_name for e in physical_children]
+                    current_names = [c.column_name for c in current_children]
+                    if physical_names != current_names:
+                        struct_field_renames[struct_col.column_name] = current_names
+
+            # Select columns; prefer field_id, fall back to rename map, then name match
+            selected_cols = []
+            for col_info in top_columns:
+                file_idx = file_field_map.get(col_info.column_id)
+                if file_idx is None:
+                    # Try current name first
+                    file_idx = file_name_map.get(col_info.column_name)
+                if file_idx is None:
+                    # Try physical (old) name via rename map
+                    for old_name, new_name in rename_map.items():
+                        if new_name == col_info.column_name:
+                            file_idx = file_name_map.get(old_name)
+                            if file_idx is not None:
+                                break
+                # Check for dropped column conflict: if this file_idx points to a
+                # column that was dropped and re-added with a different column_id,
+                # we should fill with nulls instead
+                if file_idx is not None:
+                    file_col_name = file_schema.field(file_idx).name
+                    mapped_target = rename_map.get(file_col_name)
+                    if mapped_target is not None and mapped_target.startswith("__ducklake_dropped_"):
+                        # This column in the file belongs to a dropped column
+                        if file_col_name != col_info.column_name or mapped_target != col_info.column_name:
+                            file_idx = None
+                if file_idx is not None:
+                    col_data = tbl.column(file_idx)
+                    # Apply struct field renames if needed
+                    if col_info.column_name in struct_field_renames:
+                        new_field_names = struct_field_renames[col_info.column_name]
+                        # Rebuild the struct array with renamed fields
+                        if pa.types.is_struct(col_data.type):
+                            old_type = col_data.type
+                            new_fields = []
+                            for idx, new_name in enumerate(new_field_names):
+                                if idx < old_type.num_fields:
+                                    old_field = old_type.field(idx)
+                                    new_fields.append(pa.field(new_name, old_field.type, old_field.nullable))
+                            if len(new_fields) == old_type.num_fields:
+                                chunks = []
+                                for chunk in col_data.chunks:
+                                    arrays = [chunk.field(i) for i in range(old_type.num_fields)]
+                                    new_struct = pa.StructArray.from_arrays(
+                                        arrays, fields=new_fields, mask=chunk.is_null()
+                                    )
+                                    chunks.append(new_struct)
+                                col_data = pa.chunked_array(chunks)
+                    target_type = arrow_schema.field(col_info.column_name).type
+                    if col_data.type != target_type:
+                        try:
+                            col_data = col_data.cast(target_type, safe=False)
+                        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                            pass
+                    selected_cols.append(col_data)
+                else:
+                    # Column doesn't exist in this file — fill with nulls
+                    col_type = arrow_schema.field(col_info.column_name).type
+                    null_arr = pa.nulls(tbl.num_rows, type=col_type)
+                    selected_cols.append(null_arr)
+            tbl = pa.table(
+                {name: col for name, col in zip(column_names, selected_cols)}
+            )
             frames.append(tbl)
 
         # Read inlined data
@@ -314,7 +455,7 @@ def create_ducklake_table(
 def delete_ducklake(
     path: str | Path,
     table: str,
-    predicate: Callable[[pd.DataFrame], pd.Series],
+    predicate: Callable[[pd.DataFrame], pd.Series] | bool,
     *,
     schema: str = "main",
     data_path: str | Path | None = None,
@@ -335,6 +476,7 @@ def delete_ducklake(
     predicate
         A callable that accepts a ``pd.DataFrame`` and returns a boolean
         ``pd.Series``. Rows where the series is ``True`` will be deleted.
+        Pass ``True`` to delete all rows.
     schema
         Schema name (default: "main").
     data_path
@@ -348,6 +490,14 @@ def delete_ducklake(
         The number of rows deleted.
     """
     from ducklake_pandas._writer import DuckLakeCatalogWriter
+
+    # Handle boolean predicate: True means delete all rows
+    if predicate is True:
+        import pandas as _pd
+        predicate = lambda df: _pd.Series([True] * len(df), index=df.index)
+    elif predicate is False:
+        import pandas as _pd
+        predicate = lambda df: _pd.Series([False] * len(df), index=df.index)
 
     metadata_path = os.fspath(path)
     dp = os.fspath(data_path) if data_path is not None else None
@@ -363,10 +513,10 @@ def delete_ducklake(
 
 
 def update_ducklake(
-    updates: dict[str, Any],
-    predicate: Callable[[pd.DataFrame], pd.Series],
     path: str | Path,
     table: str,
+    updates: dict[str, Any],
+    predicate: Callable[[pd.DataFrame], pd.Series],
     *,
     schema: str = "main",
     data_path: str | Path | None = None,
@@ -419,9 +569,9 @@ def update_ducklake(
 
 
 def merge_ducklake(
-    source_df: pd.DataFrame,
     path: str | Path,
     table: str,
+    source_df: pd.DataFrame,
     on: str | list[str],
     *,
     when_matched_update: dict[str, Any] | bool | None = None,
