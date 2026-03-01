@@ -45,6 +45,7 @@ dev = [
     "pytest-xdist",
     "duckdb>=1.2",
     "pandas>=1.5",
+    "hypothesis>=6.0",
 ]
 
 [tool.hatch.build.targets.wheel]
