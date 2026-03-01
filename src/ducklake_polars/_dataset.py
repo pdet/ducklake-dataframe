@@ -39,6 +39,51 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
+def _filter_delete_file_by_snapshot(path: str, snapshot_id: int) -> str | None:
+    """Filter a cumulative delete file to only include entries up to *snapshot_id*.
+
+    DuckDB v1.5 (catalog v0.4) writes cumulative delete files that contain
+    a ``_ducklake_internal_snapshot_id`` column tagging each position with
+    the snapshot that deleted it.  When time-traveling, we must strip out
+    positions from later snapshots.
+
+    Returns the path to a filtered temp file, the original *path* when no
+    filtering is needed, or ``None`` when no positions remain after filtering.
+    """
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    tbl = pq.read_table(path)
+    if "_ducklake_internal_snapshot_id" not in tbl.column_names:
+        return path
+
+    mask = pc.less_equal(
+        tbl.column("_ducklake_internal_snapshot_id"), snapshot_id
+    )
+    filtered = tbl.filter(mask)
+
+    if filtered.num_rows == 0:
+        return None
+
+    if filtered.num_rows == tbl.num_rows:
+        # All entries are within the target snapshot — use original file
+        # but still drop the internal column for Polars compatibility.
+        pass
+
+    # Drop the internal column; Polars expects only file_path + pos
+    keep_cols = [
+        c for c in filtered.column_names
+        if c != "_ducklake_internal_snapshot_id"
+    ]
+    filtered = filtered.select(keep_cols)
+
+    fd, tmp_path = tempfile.mkstemp(suffix="-delete-filtered.parquet")
+    os.close(fd)
+    atexit.register(lambda p=tmp_path: _safe_unlink(p))
+    pq.write_table(filtered, tmp_path)
+    return tmp_path
+
+
 def _cast_inlined_to_schema(
     df: pl.DataFrame, schema: dict[str, pl.DataType]
 ) -> pl.DataFrame:
@@ -484,6 +529,7 @@ class DuckLakeDataset:
         columns: list[ColumnInfo],
         filter_columns: list[str] | None,
         partition_values: dict[int, dict[int, str | None]] | None,
+        snapshot_id: int | None = None,
     ) -> dict[str, Any]:
         """Build scan_parquet kwargs for a group of files."""
         kwargs: dict[str, Any] = {
@@ -508,6 +554,18 @@ class DuckLakeDataset:
                 idx = file_id_to_idx.get(df.data_file_id)
                 if idx is not None:
                     path = reader.resolve_data_file_path(df.path, df.path_is_relative, table)
+                    # Filter cumulative delete files when time-traveling.
+                    # v0.4 catalogs set partial_max to the highest snapshot
+                    # stored in the delete file; when partial_max > target
+                    # snapshot we must strip out future positions.
+                    if (
+                        df.partial_max is not None
+                        and snapshot_id is not None
+                        and df.partial_max > snapshot_id
+                    ):
+                        path = _filter_delete_file_by_snapshot(path, snapshot_id)
+                        if path is None:
+                            continue  # no deletes at this snapshot
                     deletion_files_map.setdefault(idx, []).append(path)
             if deletion_files_map:
                 kwargs["_deletion_files"] = (
@@ -642,6 +700,7 @@ class DuckLakeDataset:
                 kwargs = self._build_scan_kwargs(
                     data_files, delete_files, reader, table,
                     columns, filter_columns, partition_values,
+                    snapshot_id=snapshot.snapshot_id,
                 )
 
                 lf = scan_parquet(sources, **kwargs)
@@ -663,6 +722,7 @@ class DuckLakeDataset:
                     kwargs = self._build_scan_kwargs(
                         group_files_list, delete_files, reader, table,
                         columns, filter_columns, partition_values,
+                        snapshot_id=snapshot.snapshot_id,
                     )
 
                     # Build a per-group schema so Polars knows about all

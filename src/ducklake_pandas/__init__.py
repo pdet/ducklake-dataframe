@@ -313,11 +313,11 @@ def read_ducklake(
             for s in stats_list:
                 file_stats_map.setdefault(s.data_file_id, {})[s.column_id] = (s.min_value, s.max_value)
 
-        # Build delete file mapping: data_file_id -> list of (path, row_id_start)
-        del_map: dict[int, list[str]] = {}
+        # Build delete file mapping: data_file_id -> list of (path, partial_max)
+        del_map: dict[int, list[tuple[str, int | None]]] = {}
         for df in delete_files:
             del_path = reader.resolve_data_file_path(df.path, df.path_is_relative, table_info)
-            del_map.setdefault(df.data_file_id, []).append(del_path)
+            del_map.setdefault(df.data_file_id, []).append((del_path, df.partial_max))
 
         frames: list[pa.Table] = []
 
@@ -341,8 +341,23 @@ def read_ducklake(
             # Apply delete files (Iceberg position-delete format)
             if f.data_file_id in del_map:
                 all_positions: list[int] = []
-                for del_path in del_map[f.data_file_id]:
+                for del_path, partial_max in del_map[f.data_file_id]:
                     del_tbl = pq.read_table(del_path)
+                    # Filter cumulative delete files when time-traveling.
+                    # v0.4 catalogs tag each position with the snapshot that
+                    # deleted it via _ducklake_internal_snapshot_id.
+                    if (
+                        partial_max is not None
+                        and partial_max > snap.snapshot_id
+                        and "_ducklake_internal_snapshot_id" in del_tbl.column_names
+                    ):
+                        import pyarrow.compute as pc
+
+                        mask = pc.less_equal(
+                            del_tbl.column("_ducklake_internal_snapshot_id"),
+                            snap.snapshot_id,
+                        )
+                        del_tbl = del_tbl.filter(mask)
                     if "pos" in del_tbl.column_names:
                         positions = del_tbl.column("pos").to_pylist()
                         all_positions.extend(
@@ -484,6 +499,21 @@ def read_ducklake(
             column_names,
         )
         if inlined is not None and inlined.num_rows > 0:
+            # Cast inlined data to target schema (inlined values stored as strings)
+            cast_cols = []
+            for col_name in inlined.column_names:
+                col = inlined.column(col_name)
+                if col_name in arrow_schema.names:
+                    target_type = arrow_schema.field(col_name).type
+                    if col.type != target_type:
+                        try:
+                            col = col.cast(target_type, safe=False)
+                        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                            pass
+                cast_cols.append(col)
+            inlined = pa.table(
+                {name: col for name, col in zip(inlined.column_names, cast_cols)}
+            )
             frames.append(inlined)
 
     if not frames:

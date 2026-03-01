@@ -10,7 +10,7 @@ from ducklake_core._backend import create_backend
 
 import pyarrow as pa
 
-SUPPORTED_DUCKLAKE_VERSIONS = {"0.3"}
+SUPPORTED_DUCKLAKE_VERSIONS = {"0.3", "0.4"}
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -40,6 +40,7 @@ class DeleteFileInfo:
     path: str
     path_is_relative: bool
     delete_count: int
+    partial_max: int | None = None
 
 
 @dataclass
@@ -164,6 +165,7 @@ class DuckLakeCatalogReader:
         self._data_path_override = data_path_override
         self._con: Any = None
         self._data_path: str | None = None
+        self._catalog_version: str | None = None
 
     def _connect(self) -> Any:
         if self._con is None:
@@ -186,6 +188,7 @@ class DuckLakeCatalogReader:
                 f"Supported versions: {', '.join(sorted(SUPPORTED_DUCKLAKE_VERSIONS))}"
             )
             raise ValueError(msg)
+        self._catalog_version = version
 
     def _sql(self, query: str) -> str:
         """Translate ``?`` placeholders to the backend's parameter style.
@@ -406,6 +409,29 @@ class DuckLakeCatalogReader:
     def get_delete_files(self, table_id: int, snapshot_id: int) -> list[DeleteFileInfo]:
         """Get delete files for a table at a specific snapshot."""
         con = self._connect()
+        if self._catalog_version is not None and self._catalog_version >= "0.4":
+            rows = con.execute(
+                self._sql("""
+                SELECT delete_file_id, data_file_id, path, path_is_relative,
+                       delete_count, partial_max
+                FROM ducklake_delete_file
+                WHERE table_id = ?
+                  AND ? >= begin_snapshot
+                  AND (? < end_snapshot OR end_snapshot IS NULL)
+                """),
+                [table_id, snapshot_id, snapshot_id],
+            ).fetchall()
+            return [
+                DeleteFileInfo(
+                    delete_file_id=r[0],
+                    data_file_id=r[1],
+                    path=r[2],
+                    path_is_relative=bool(r[3]) if r[3] is not None else True,
+                    delete_count=r[4],
+                    partial_max=r[5],
+                )
+                for r in rows
+            ]
         rows = con.execute(
             self._sql("""
             SELECT delete_file_id, data_file_id, path, path_is_relative, delete_count
@@ -882,11 +908,37 @@ class DuckLakeCatalogReader:
         frames: list[pa.Table] = []
 
         for info in inlined_tables:
-            cols_sql = ", ".join(
-                f'"{c.replace(chr(34), chr(34) + chr(34))}"' for c in column_names
-            )
             safe_table = info.table_name.replace('"', '""')
             ph = self._backend.placeholder
+
+            # Discover which columns actually exist in this inlined table.
+            # Each schema version may have a different set of columns
+            # (e.g. after ADD COLUMN).  SQLite silently returns string
+            # literals for double-quoted identifiers that don't match a
+            # column, so we must probe first.
+            try:
+                desc_cursor = con.execute(
+                    f'SELECT * FROM "{safe_table}" LIMIT 0'
+                )
+                available_cols = (
+                    {d[0] for d in desc_cursor.description}
+                    if desc_cursor.description
+                    else set()
+                )
+            except Exception as e:
+                if self._backend.is_table_not_found(e):
+                    continue
+                raise
+
+            existing_cols = [c for c in column_names if c in available_cols]
+            missing_cols = [c for c in column_names if c not in available_cols]
+
+            if not existing_cols:
+                continue
+
+            cols_sql = ", ".join(
+                f'"{c.replace(chr(34), chr(34) + chr(34))}"' for c in existing_cols
+            )
             try:
                 cursor = con.execute(
                     f"""
@@ -906,11 +958,14 @@ class DuckLakeCatalogReader:
             if rows:
                 data = {
                     name: [row[i] for row in rows]
-                    for i, name in enumerate(column_names)
+                    for i, name in enumerate(existing_cols)
                 }
+                # Fill missing columns with NULLs
+                for col in missing_cols:
+                    data[col] = [None] * len(rows)
                 frames.append(pa.table(data))
 
         if not frames:
             return None
 
-        return pa.concat_tables(frames)
+        return pa.concat_tables(frames, promote_options="permissive")
