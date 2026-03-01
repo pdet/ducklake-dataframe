@@ -39,12 +39,141 @@ __all__ = [
 ]
 
 
+def _can_skip_file_by_partition(
+    file_id: int,
+    partition_col_map: dict[int, str],
+    file_partition_values: dict[int, dict[int, str | None]],
+    predicate: Callable,
+    column_names: list[str],
+) -> bool:
+    """Check if a file can be skipped based on partition values.
+
+    Builds a single-row DataFrame from the file's partition values and
+    evaluates the predicate on it.  If the predicate returns False for
+    that row, the file can be safely skipped.
+
+    Parameters
+    ----------
+    file_id
+        The data_file_id to check.
+    partition_col_map
+        Mapping from partition_key_index to column_name.
+    file_partition_values
+        Mapping from data_file_id -> {partition_key_index -> value}.
+    predicate
+        User-supplied predicate callable.
+    column_names
+        All column names in the table schema.
+
+    Returns
+    -------
+    bool
+        True if the file can be skipped.
+    """
+    import pandas as pd
+
+    if not partition_col_map or file_id not in file_partition_values:
+        return False
+
+    pv = file_partition_values[file_id]  # {key_index -> value}
+    row_data: dict[str, list] = {}
+    for key_idx, col_name in partition_col_map.items():
+        val = pv.get(key_idx)
+        row_data[col_name] = [val]
+
+    # Do NOT fill non-partition columns. If the predicate references them
+    # it will raise a KeyError, which we catch below — meaning the file
+    # cannot be pruned by partition values alone. This avoids the problem
+    # where None/NaN comparisons silently return False and cause incorrect
+    # skipping.
+
+    try:
+        probe = pd.DataFrame(row_data)
+        # Attempt to cast partition columns to numeric where possible so
+        # that predicates using numeric comparisons work correctly.
+        for col_name in partition_col_map.values():
+            try:
+                probe[col_name] = pd.to_numeric(probe[col_name])
+            except (ValueError, TypeError):
+                pass
+        mask = predicate(probe)
+        # If the predicate returns all False, this file can be skipped.
+        if hasattr(mask, "__iter__"):
+            return not mask.any()
+        return not bool(mask)
+    except Exception:
+        # If we can't evaluate the predicate, don't skip the file.
+        return False
+
+
+def _can_skip_file_by_stats(
+    file_id: int,
+    file_stats: dict[int, dict[int, tuple[str | None, str | None]]],
+    col_id_to_name: dict[int, str],
+    predicate: Callable,
+    column_names: list[str],
+) -> bool:
+    """Check if a file can be skipped based on column min/max statistics.
+
+    For each column with stats, we build a two-row DataFrame containing
+    the min and max values.  If the predicate returns False for both rows,
+    no row in the file can match and it can be skipped.
+
+    This is best-effort: if evaluation fails, we don't skip.
+    """
+    import pandas as pd
+
+    if file_id not in file_stats:
+        return False
+
+    stats = file_stats[file_id]  # {column_id -> (min_val, max_val)}
+    if not stats:
+        return False
+
+    # Build a two-row DataFrame: row 0 = all mins, row 1 = all maxes
+    row_data: dict[str, list] = {}
+    has_useful_stats = False
+    for col_id, (min_val, max_val) in stats.items():
+        col_name = col_id_to_name.get(col_id)
+        if col_name is None:
+            continue
+        if min_val is not None and max_val is not None:
+            has_useful_stats = True
+            row_data[col_name] = [min_val, max_val]
+        else:
+            row_data[col_name] = [None, None]
+
+    if not has_useful_stats:
+        return False
+
+    # Fill missing columns with None
+    for col in column_names:
+        if col not in row_data:
+            row_data[col] = [None, None]
+
+    try:
+        probe = pd.DataFrame(row_data)
+        # Cast to numeric where possible
+        for col in probe.columns:
+            try:
+                probe[col] = pd.to_numeric(probe[col])
+            except (ValueError, TypeError):
+                pass
+        mask = predicate(probe)
+        if hasattr(mask, "__iter__"):
+            return not mask.any()
+        return not bool(mask)
+    except Exception:
+        return False
+
+
 def read_ducklake(
     path: str | Path,
     table: str,
     *,
     schema: str = "main",
     columns: list[str] | None = None,
+    predicate: Callable[[pd.DataFrame], pd.Series] | None = None,
     snapshot_version: int | None = None,
     snapshot_time: datetime | str | None = None,
     data_path: str | Path | None = None,
@@ -63,6 +192,12 @@ def read_ducklake(
         Schema name (default: "main").
     columns
         Columns to select. If None, reads all columns.
+    predicate
+        An optional callable that accepts a ``pd.DataFrame`` and returns a
+        boolean ``pd.Series``. When provided, partition pruning and
+        file-level statistics pruning are applied to skip files that
+        cannot match the predicate. The predicate is also applied to
+        the final result to filter rows.
     snapshot_version
         Read the table at a specific snapshot version.
     snapshot_time
@@ -143,6 +278,37 @@ def read_ducklake(
         data_files = reader.get_data_files(table_info.table_id, snap.snapshot_id)
         delete_files = reader.get_delete_files(table_info.table_id, snap.snapshot_id)
 
+        # --- Partition & stats pruning ---
+        # Build partition metadata if a predicate is provided
+        partition_col_map: dict[int, str] = {}  # key_index -> column_name
+        file_partition_values: dict[int, dict[int, str | None]] = {}  # file_id -> {key_index -> value}
+        file_stats_map: dict[int, dict[int, tuple[str | None, str | None]]] = {}  # file_id -> {col_id -> (min, max)}
+
+        if predicate is not None and data_files:
+            # Get partition info
+            part_info = reader.get_partition_info(table_info.table_id, snap.snapshot_id)
+            if part_info is not None:
+                part_cols = reader.get_partition_columns(part_info.partition_id, table_info.table_id)
+                # Only use identity-transform partitions for pruning
+                for pc in part_cols:
+                    if pc.transform == "identity":
+                        col_name = col_id_to_name.get(pc.column_id)
+                        if col_name is not None:
+                            partition_col_map[pc.partition_key_index] = col_name
+
+                if partition_col_map:
+                    file_ids = [f.data_file_id for f in data_files]
+                    pv_list = reader.get_file_partition_values(table_info.table_id, file_ids)
+                    for pv in pv_list:
+                        file_partition_values.setdefault(pv.data_file_id, {})[pv.partition_key_index] = pv.partition_value
+
+            # Get column stats for all files
+            file_ids = [f.data_file_id for f in data_files]
+            col_ids = [c.column_id for c in top_columns]
+            stats_list = reader.get_column_stats(table_info.table_id, file_ids, col_ids)
+            for s in stats_list:
+                file_stats_map.setdefault(s.data_file_id, {})[s.column_id] = (s.min_value, s.max_value)
+
         # Build delete file mapping: data_file_id -> list of (path, row_id_start)
         del_map: dict[int, list[str]] = {}
         for df in delete_files:
@@ -152,6 +318,19 @@ def read_ducklake(
         frames: list[pa.Table] = []
 
         for f in data_files:
+            # Partition pruning: skip files whose partition values don't match
+            if predicate is not None and _can_skip_file_by_partition(
+                f.data_file_id, partition_col_map, file_partition_values,
+                predicate, column_names,
+            ):
+                continue
+
+            # Stats pruning: skip files where min/max proves no rows match
+            if predicate is not None and _can_skip_file_by_stats(
+                f.data_file_id, file_stats_map, col_id_to_name,
+                predicate, column_names,
+            ):
+                continue
             file_path = reader.resolve_data_file_path(f.path, f.path_is_relative, table_info)
             tbl = pq.ParquetFile(file_path).read()
 
@@ -308,6 +487,11 @@ def read_ducklake(
         result = arrow_schema.empty_table().to_pandas()
     else:
         result = pa.concat_tables(frames, promote_options="permissive").to_pandas()
+
+    # Apply predicate to final result for precise row-level filtering
+    if predicate is not None and len(result) > 0:
+        mask = predicate(result)
+        result = result.loc[mask].reset_index(drop=True)
 
     if columns is not None:
         result = result[columns]

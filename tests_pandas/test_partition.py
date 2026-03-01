@@ -410,3 +410,145 @@ class TestNonIdentityPartition:
         result = result[result["ts"] < datetime(2021, 1, 1)]
         result = result.sort_values("id").reset_index(drop=True)
         assert result["id"].tolist() == [1, 2]
+
+
+class TestPartitionPredicatePruning:
+    """Test partition pruning and stats pruning via the predicate parameter."""
+
+    def test_read_with_predicate_skips_partitions(self, ducklake_catalog):
+        """Verify correct results when predicate filters on partition column."""
+        cat = ducklake_catalog
+
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR)")
+        cat.execute("ALTER TABLE ducklake.test SET PARTITIONED BY (b)")
+        # Insert two batches to create files per partition
+        cat.execute("INSERT INTO ducklake.test VALUES (1, 'x'), (2, 'y'), (3, 'x')")
+        cat.close()
+
+        # Predicate on partition column
+        result = read_ducklake(
+            cat.metadata_path, "test",
+            predicate=lambda df: df["b"] == "x",
+        )
+        result = result.sort_values("a").reset_index(drop=True)
+        assert result["a"].tolist() == [1, 3]
+        assert result["b"].tolist() == ["x", "x"]
+
+    def test_read_predicate_correctness(self, ducklake_catalog):
+        """Predicate results must match full read + manual filter."""
+        cat = ducklake_catalog
+
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR)")
+        cat.execute("ALTER TABLE ducklake.test SET PARTITIONED BY (b)")
+        cat.execute(
+            "INSERT INTO ducklake.test VALUES "
+            "(1, 'x'), (2, 'y'), (3, 'x'), (4, 'z'), (5, 'y')"
+        )
+        cat.close()
+
+        pred = lambda df: df["b"] == "y"
+
+        # With predicate
+        result_pred = read_ducklake(
+            cat.metadata_path, "test", predicate=pred,
+        ).sort_values("a").reset_index(drop=True)
+
+        # Manual: read all, then filter
+        result_all = read_ducklake(cat.metadata_path, "test")
+        result_manual = result_all[pred(result_all)].sort_values("a").reset_index(drop=True)
+
+        pd.testing.assert_frame_equal(result_pred, result_manual)
+
+    def test_predicate_multi_partition_keys(self, ducklake_catalog):
+        """Predicate filtering with multiple partition columns."""
+        cat = ducklake_catalog
+
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR, c INTEGER)")
+        cat.execute("ALTER TABLE ducklake.test SET PARTITIONED BY (b, c)")
+        cat.execute(
+            "INSERT INTO ducklake.test VALUES "
+            "(1, 'x', 10), (2, 'y', 20), (3, 'x', 30), (4, 'y', 10)"
+        )
+        cat.close()
+
+        result = read_ducklake(
+            cat.metadata_path, "test",
+            predicate=lambda df: (df["b"] == "x") & (df["c"] == 10),
+        )
+        result = result.sort_values("a").reset_index(drop=True)
+        assert result["a"].tolist() == [1]
+        assert result["b"].tolist() == ["x"]
+        assert result["c"].tolist() == [10]
+
+    def test_predicate_on_non_partition_column(self, ducklake_catalog):
+        """Predicate on non-partition column still returns correct results."""
+        cat = ducklake_catalog
+
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR)")
+        cat.execute("ALTER TABLE ducklake.test SET PARTITIONED BY (b)")
+        cat.execute("INSERT INTO ducklake.test VALUES (1, 'x'), (2, 'y'), (3, 'x')")
+        cat.close()
+
+        result = read_ducklake(
+            cat.metadata_path, "test",
+            predicate=lambda df: df["a"] > 1,
+        )
+        result = result.sort_values("a").reset_index(drop=True)
+        assert result["a"].tolist() == [2, 3]
+
+    def test_predicate_no_match_returns_empty(self, ducklake_catalog):
+        """Predicate that matches nothing returns empty DataFrame."""
+        cat = ducklake_catalog
+
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR)")
+        cat.execute("ALTER TABLE ducklake.test SET PARTITIONED BY (b)")
+        cat.execute("INSERT INTO ducklake.test VALUES (1, 'x'), (2, 'y')")
+        cat.close()
+
+        result = read_ducklake(
+            cat.metadata_path, "test",
+            predicate=lambda df: df["b"] == "nonexistent",
+        )
+        assert result.shape[0] == 0
+        assert list(result.columns) == ["a", "b"]
+
+    def test_predicate_with_stats_pruning(self, ducklake_catalog):
+        """Predicate uses min/max stats to skip files on non-partition tables."""
+        cat = ducklake_catalog
+
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR)")
+        # Two separate inserts create two separate files with distinct ranges
+        cat.execute("INSERT INTO ducklake.test VALUES (1, 'x'), (2, 'x')")
+        cat.execute("INSERT INTO ducklake.test VALUES (10, 'y'), (20, 'y')")
+        cat.close()
+
+        # This should return only rows from the second file
+        result = read_ducklake(
+            cat.metadata_path, "test",
+            predicate=lambda df: df["a"] >= 10,
+        )
+        result = result.sort_values("a").reset_index(drop=True)
+        assert result["a"].tolist() == [10, 20]
+        assert result["b"].tolist() == ["y", "y"]
+
+    def test_predicate_correctness_with_multiple_inserts(self, ducklake_catalog):
+        """Multiple inserts with predicate: result matches manual filter."""
+        cat = ducklake_catalog
+
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR)")
+        cat.execute("ALTER TABLE ducklake.test SET PARTITIONED BY (b)")
+        cat.execute("INSERT INTO ducklake.test VALUES (1, 'x'), (2, 'x')")
+        cat.execute("INSERT INTO ducklake.test VALUES (3, 'y'), (4, 'y')")
+        cat.execute("INSERT INTO ducklake.test VALUES (5, 'z'), (6, 'z')")
+        cat.close()
+
+        pred = lambda df: df["b"].isin(["x", "z"])
+
+        result_pred = read_ducklake(
+            cat.metadata_path, "test", predicate=pred,
+        ).sort_values("a").reset_index(drop=True)
+
+        result_all = read_ducklake(cat.metadata_path, "test")
+        result_manual = result_all[pred(result_all)].sort_values("a").reset_index(drop=True)
+
+        pd.testing.assert_frame_equal(result_pred, result_manual)

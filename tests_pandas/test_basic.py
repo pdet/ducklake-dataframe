@@ -192,6 +192,79 @@ class TestEdgeCases:
             read_ducklake(cat.metadata_path, "test", columns=["nonexistent"])
 
 
+class TestPredicate:
+    """Test read_ducklake with predicate parameter."""
+
+    def test_read_with_predicate(self, ducklake_catalog):
+        """Basic predicate usage filters rows."""
+        cat = ducklake_catalog
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR)")
+        cat.execute("INSERT INTO ducklake.test VALUES (1, 'x'), (2, 'y'), (3, 'x'), (4, 'z')")
+        cat.close()
+
+        result = read_ducklake(
+            cat.metadata_path, "test",
+            predicate=lambda df: df["a"] > 2,
+        )
+        result = result.sort_values("a").reset_index(drop=True)
+        assert result["a"].tolist() == [3, 4]
+        assert result["b"].tolist() == ["x", "z"]
+
+    def test_read_with_predicate_string_filter(self, ducklake_catalog):
+        """Predicate filtering on string column."""
+        cat = ducklake_catalog
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR)")
+        cat.execute("INSERT INTO ducklake.test VALUES (1, 'hello'), (2, 'world'), (3, 'hello')")
+        cat.close()
+
+        result = read_ducklake(
+            cat.metadata_path, "test",
+            predicate=lambda df: df["b"] == "hello",
+        )
+        result = result.sort_values("a").reset_index(drop=True)
+        assert result["a"].tolist() == [1, 3]
+        assert result["b"].tolist() == ["hello", "hello"]
+
+    def test_read_with_predicate_no_match(self, ducklake_catalog):
+        """Predicate that matches nothing returns empty DataFrame."""
+        cat = ducklake_catalog
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER)")
+        cat.execute("INSERT INTO ducklake.test VALUES (1), (2), (3)")
+        cat.close()
+
+        result = read_ducklake(
+            cat.metadata_path, "test",
+            predicate=lambda df: df["a"] > 100,
+        )
+        assert result.shape[0] == 0
+
+    def test_read_with_predicate_and_columns(self, ducklake_catalog):
+        """Predicate combined with column selection."""
+        cat = ducklake_catalog
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR, c DOUBLE)")
+        cat.execute("INSERT INTO ducklake.test VALUES (1, 'x', 1.0), (2, 'y', 2.0), (3, 'x', 3.0)")
+        cat.close()
+
+        result = read_ducklake(
+            cat.metadata_path, "test",
+            predicate=lambda df: df["a"] >= 2,
+            columns=["a", "c"],
+        )
+        result = result.sort_values("a").reset_index(drop=True)
+        assert list(result.columns) == ["a", "c"]
+        assert result["a"].tolist() == [2, 3]
+
+    def test_read_with_predicate_none_is_noop(self, ducklake_catalog):
+        """predicate=None returns all rows (default behavior)."""
+        cat = ducklake_catalog
+        cat.execute("CREATE TABLE ducklake.test (a INTEGER)")
+        cat.execute("INSERT INTO ducklake.test VALUES (1), (2), (3)")
+        cat.close()
+
+        result = read_ducklake(cat.metadata_path, "test", predicate=None)
+        assert result.shape[0] == 3
+
+
 class TestMultipleTables:
     """Test reading from multiple tables."""
 
