@@ -97,17 +97,22 @@ def _has_renames(
     history: list[ColumnHistoryEntry],
     current_columns: list[ColumnInfo],
 ) -> bool:
-    """Check if any column has been renamed, has a drop+re-add conflict, or struct field rename."""
+    """Check if any column has been renamed, has a type change, drop+re-add conflict, or struct field rename."""
     top_history = _top_level_history(history)
     top_current = [c for c in current_columns if c.parent_column is None]
     current_names = {c.column_id: c.column_name for c in top_current}
+    current_types = {c.column_id: c.column_type for c in top_current}
     current_name_set = set(current_names.values())
 
-    # Check top-level renames and drop+re-add conflicts
+    # Check top-level renames, type changes, and drop+re-add conflicts
     for entry in top_history:
         if entry.column_id in current_names:
             if entry.column_name != current_names[entry.column_id]:
                 return True
+            # Check type changes (same column_id, different type)
+            if entry.column_type and entry.column_id in current_types:
+                if entry.column_type != current_types[entry.column_id]:
+                    return True
         elif entry.column_name in current_name_set:
             return True
 
@@ -233,12 +238,71 @@ def _get_struct_field_renames(
     return result if result else None
 
 
+def _get_type_cast_map(
+    file_begin_snapshot: int,
+    history: list[ColumnHistoryEntry],
+    current_columns: list[ColumnInfo],
+    all_columns: list[ColumnInfo],
+) -> dict[str, tuple[pl.DataType, pl.DataType]]:
+    """Get {column_name: (old_polars_type, current_polars_type)} for columns with type changes.
+
+    Only returns entries where the column type at file write time differs from
+    the current column type.
+    """
+    top_history = _top_level_history(history)
+    top_current = [c for c in current_columns if c.parent_column is None]
+    current_types: dict[int, str] = {c.column_id: c.column_type for c in top_current}
+    current_names: dict[int, str] = {c.column_id: c.column_name for c in top_current}
+
+    result: dict[str, tuple[pl.DataType, pl.DataType]] = {}
+    for entry in top_history:
+        if entry.column_id not in current_types:
+            continue
+        if not _is_active_at(entry, file_begin_snapshot):
+            continue
+        if entry.column_type and entry.column_type != current_types[entry.column_id]:
+            col_name = current_names[entry.column_id]
+            old_pl_type = resolve_column_type(
+                entry.column_id, entry.column_type, all_columns
+            )
+            cur_pl_type = resolve_column_type(
+                entry.column_id, current_types[entry.column_id], all_columns
+            )
+            result[col_name] = (old_pl_type, cur_pl_type)
+    return result
+
+
+def _get_physical_type_key(
+    file_begin_snapshot: int,
+    history: list[ColumnHistoryEntry],
+    current_columns: list[ColumnInfo],
+) -> frozenset[tuple[int, str]]:
+    """Get a hashable key representing the physical column types at a given snapshot.
+
+    Returns a frozenset of (column_id, physical_type) for columns whose type
+    at the file's snapshot differs from the current type.
+    """
+    top_history = _top_level_history(history)
+    top_current = [c for c in current_columns if c.parent_column is None]
+    current_types: dict[int, str] = {c.column_id: c.column_type for c in top_current}
+
+    diffs: list[tuple[int, str]] = []
+    for entry in top_history:
+        if entry.column_id not in current_types:
+            continue
+        if not _is_active_at(entry, file_begin_snapshot):
+            continue
+        if entry.column_type and entry.column_type != current_types[entry.column_id]:
+            diffs.append((entry.column_id, entry.column_type))
+    return frozenset(diffs)
+
+
 def _group_files_by_rename_map(
     files: list[FileInfo],
     history: list[ColumnHistoryEntry],
     current_columns: list[ColumnInfo],
 ) -> list[tuple[dict[str, str], Any, list[FileInfo]]]:
-    """Group files by their rename map and struct field renames.
+    """Group files by their rename map, struct field renames, and type changes.
 
     Returns list of (rename_map, struct_field_renames, files_list) tuples.
     struct_field_renames is ``dict[str, list[str]] | None``.
@@ -250,12 +314,13 @@ def _group_files_by_rename_map(
     for f in files:
         rmap = _get_rename_map(f.begin_snapshot, history, current_columns)
         srenames = _get_struct_field_renames(f.begin_snapshot, history, current_columns)
+        type_key = _get_physical_type_key(f.begin_snapshot, history, current_columns)
 
         rmap_key = frozenset(rmap.items())
         sren_key = None
         if srenames:
             sren_key = frozenset((k, tuple(v)) for k, v in srenames.items())
-        key = (rmap_key, sren_key)
+        key = (rmap_key, sren_key, type_key)
 
         groups[key].append(f)
         if key not in rename_maps:
@@ -603,6 +668,20 @@ class DuckLakeDataset:
                     # current columns (even if the first file lacks some).
                     group_schema = dict(catalog_schema)
 
+                    # Compute type casts for this group early so we can
+                    # adjust the physical schema before scanning.
+                    type_casts = _get_type_cast_map(
+                        group_files_list[0].begin_snapshot,
+                        history, all_columns, all_columns,
+                    )
+
+                    # Replace current types with old (physical) types in the
+                    # schema so scan_parquet matches the Parquet file layout.
+                    if type_casts:
+                        for col_name, (old_type, _new_type) in type_casts.items():
+                            if col_name in group_schema:
+                                group_schema[col_name] = old_type
+
                     if rename_map:
                         # For groups with renames, build a physical schema:
                         # swap current names for their physical names.
@@ -657,6 +736,15 @@ class DuckLakeDataset:
                         applicable = {k: v for k, v in rename_map.items() if k in df.columns}
                         if applicable:
                             df = df.rename(applicable)
+
+                    # Apply type casts for columns whose type changed after the file was written
+                    if type_casts:
+                        cast_exprs = []
+                        for col_name, (_old_type, new_type) in type_casts.items():
+                            if col_name in df.columns:
+                                cast_exprs.append(pl.col(col_name).cast(new_type))
+                        if cast_exprs:
+                            df = df.with_columns(cast_exprs)
 
                     # Drop columns not in the current schema
                     keep = [n for n in column_names if n in df.columns]

@@ -2902,6 +2902,106 @@ class DuckLakeCatalogWriter:
         con.commit()
 
     # ------------------------------------------------------------------
+    # ALTER TABLE: SET COLUMN TYPE
+    # ------------------------------------------------------------------
+
+    def set_column_type(
+        self,
+        table_name: str,
+        column_name: str,
+        new_type: str,
+        *,
+        schema_name: str = "main",
+    ) -> None:
+        """Change the type of a column in an existing table.
+
+        Existing Parquet files keep their original types; the reader must
+        cast values when reading files written with an older column type.
+
+        Parameters
+        ----------
+        table_name
+            Name of the table to alter.
+        column_name
+            Name of the column whose type to change.
+        new_type
+            DuckDB type string for the new column type (e.g. ``"BIGINT"``).
+        schema_name
+            Schema name (default: ``"main"``).
+        """
+        con = self._connect()
+        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+
+        table_id = self._table_exists(table_name, schema_name, snap_id)
+        if table_id is None:
+            msg = f"Table '{schema_name}.{table_name}' not found"
+            raise ValueError(msg)
+
+        columns = self._get_columns_for_table(table_id, snap_id)
+        target_col: tuple[int, str, str, int | None] | None = None
+        for col_id, col_name, col_type, parent in columns:
+            if col_name == column_name:
+                target_col = (col_id, col_name, col_type, parent)
+                break
+
+        if target_col is None:
+            msg = f"Column '{column_name}' not found in '{schema_name}.{table_name}'"
+            raise ValueError(msg)
+
+        col_id, _name, _old_type, parent_column = target_col
+
+        # Normalize the new type to DuckDB's internal representation
+        # by round-tripping through Arrow
+        arrow_type = duckdb_type_to_arrow(new_type)
+        duckdb_new_type = arrow_type_to_duckdb(arrow_type)
+
+        row = con.execute(
+            "SELECT column_order, nulls_allowed, initial_default, default_value "
+            "FROM ducklake_column "
+            "WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+            [table_id, col_id],
+        ).fetchone()
+        col_order = row[0]
+        nulls_allowed = row[1]
+        initial_default = row[2]
+        default_value = row[3]
+
+        new_schema_ver = schema_ver + 1
+
+        new_snap = self._create_snapshot(new_schema_ver, next_cat_id, next_file_id)
+
+        # End the old column entry
+        con.execute(
+            "UPDATE ducklake_column SET end_snapshot = ? "
+            "WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+            [new_snap, table_id, col_id],
+        )
+
+        # Create new column entry with the same column_id but new type
+        con.execute(
+            "INSERT INTO ducklake_column "
+            "(column_id, begin_snapshot, end_snapshot, table_id, column_order, "
+            "column_name, column_type, initial_default, default_value, "
+            "nulls_allowed, parent_column) "
+            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                col_id, new_snap, table_id, col_order,
+                column_name, duckdb_new_type, initial_default, default_value,
+                nulls_allowed, parent_column,
+            ],
+        )
+
+        con.execute(
+            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
+            "VALUES (?, ?)",
+            [new_snap, new_schema_ver],
+        )
+
+        self._record_change(new_snap, f"altered_table:{table_id}")
+
+        con.commit()
+
+    # ------------------------------------------------------------------
     # DROP TABLE
     # ------------------------------------------------------------------
 

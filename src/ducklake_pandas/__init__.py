@@ -24,6 +24,7 @@ __all__ = [
     "alter_ducklake_add_column",
     "alter_ducklake_drop_column",
     "alter_ducklake_rename_column",
+    "alter_ducklake_set_type",
     "alter_ducklake_set_partitioned_by",
     "drop_ducklake_table",
     "create_ducklake_schema",
@@ -876,6 +877,59 @@ def alter_ducklake_set_partitioned_by(
         author=author, commit_message=commit_message,
     ) as writer:
         writer.set_partitioned_by(table, column_names, schema_name=schema)
+
+
+def alter_ducklake_set_type(
+    path: str | Path,
+    table: str,
+    column_name: str,
+    new_type: str,
+    *,
+    schema: str = "main",
+    data_path: str | Path | None = None,
+    author: str | None = None,
+    commit_message: str | None = None,
+) -> None:
+    """
+    Change the type of a column in a DuckLake table.
+
+    Existing Parquet files keep their original types; the reader casts
+    values from the old type when reading files written before the change.
+
+    Parameters
+    ----------
+    path
+        Path to the DuckLake metadata catalog file (.ducklake or .db).
+        Supports SQLite and PostgreSQL backends.
+    table
+        Name of the table to alter.
+    column_name
+        Name of the column whose type to change.
+    new_type
+        DuckDB type string for the new column type (e.g., ``"BIGINT"``,
+        ``"VARCHAR"``, ``"DOUBLE"``).
+    schema
+        Schema name (default: "main").
+    data_path
+        Override the data path stored in the catalog.
+
+    Raises
+    ------
+    ValueError
+        If the table or column does not exist.
+    """
+    from ducklake_pandas._writer import DuckLakeCatalogWriter
+
+    metadata_path = os.fspath(path)
+    dp = os.fspath(data_path) if data_path is not None else None
+
+    with DuckLakeCatalogWriter(
+        metadata_path, data_path_override=dp,
+        author=author, commit_message=commit_message,
+    ) as writer:
+        writer.set_column_type(
+            table, column_name, new_type, schema_name=schema
+        )
 
 
 def drop_ducklake_table(

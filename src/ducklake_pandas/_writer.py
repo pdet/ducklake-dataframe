@@ -268,6 +268,18 @@ class DuckLakeCatalogWriter:
             table_name, column_name, schema_name=schema_name,
         )
 
+    def set_column_type(
+        self,
+        table_name: str,
+        column_name: str,
+        new_type: str,
+        *,
+        schema_name: str = "main",
+    ) -> None:
+        self._core.set_column_type(
+            table_name, column_name, new_type, schema_name=schema_name,
+        )
+
     # ------------------------------------------------------------------
     # TABLE operations
     # ------------------------------------------------------------------

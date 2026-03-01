@@ -12,6 +12,7 @@ from tests_pandas.helpers import assert_list_equal
 from ducklake_pandas import (
     alter_ducklake_add_column,
     alter_ducklake_drop_column,
+    alter_ducklake_set_type,
     read_ducklake,
     write_ducklake,
 )
@@ -446,3 +447,102 @@ class TestAlterAndUpdate:
         result = read_ducklake(cat.metadata_path, "test").sort_values("a").reset_index(drop=True)
         assert list(result.columns) == ["a", "b"]
         assert result["b"].tolist() == ["x", "NEW", "z"]
+
+
+# ---------------------------------------------------------------------------
+# SET TYPE: column type changes
+# ---------------------------------------------------------------------------
+
+
+class TestSetType:
+    """Test ALTER TABLE SET TYPE (column type changes)."""
+
+    def test_integer_to_bigint(self, make_write_catalog):
+        """Change INTEGER to BIGINT and read back."""
+        cat = make_write_catalog()
+        df = pd.DataFrame({"a": np.array([1, 2, 3], dtype=np.int32), "b": ["x", "y", "z"]})
+        write_ducklake(df, cat.metadata_path, "test", mode="error")
+
+        alter_ducklake_set_type(cat.metadata_path, "test", "a", "BIGINT")
+
+        result = read_ducklake(cat.metadata_path, "test").sort_values("a").reset_index(drop=True)
+        assert result["a"].tolist() == [1, 2, 3]
+        assert result["b"].tolist() == ["x", "y", "z"]
+
+    def test_varchar_to_integer(self, make_write_catalog):
+        """Change VARCHAR to INTEGER where data is numeric strings."""
+        cat = make_write_catalog()
+        df = pd.DataFrame({"id": [1, 2, 3], "val": ["10", "20", "30"]})
+        write_ducklake(df, cat.metadata_path, "test", mode="error")
+
+        alter_ducklake_set_type(cat.metadata_path, "test", "val", "INTEGER")
+
+        result = read_ducklake(cat.metadata_path, "test").sort_values("id").reset_index(drop=True)
+        assert result["val"].tolist() == [10, 20, 30]
+
+    def test_read_across_type_change_time_travel(self, make_write_catalog):
+        """Read at a snapshot before the type change to get the old type."""
+        cat = make_write_catalog()
+        df = pd.DataFrame({"a": np.array([1, 2], dtype=np.int32)})
+        write_ducklake(df, cat.metadata_path, "test", mode="error")
+
+        # Snapshot before type change
+        v_before = cat.query_one(
+            "SELECT MAX(snapshot_id) FROM ducklake_snapshot"
+        )[0]
+
+        alter_ducklake_set_type(cat.metadata_path, "test", "a", "BIGINT")
+
+        # Insert data after type change
+        df2 = pd.DataFrame({"a": np.array([3, 4], dtype=np.int64)})
+        write_ducklake(df2, cat.metadata_path, "test", mode="append")
+
+        # Read latest: should have all values
+        result = read_ducklake(cat.metadata_path, "test").sort_values("a").reset_index(drop=True)
+        assert result["a"].tolist() == [1, 2, 3, 4]
+
+        # Read at old snapshot: should only have old values
+        result_old = read_ducklake(
+            cat.metadata_path, "test", snapshot_version=v_before
+        ).sort_values("a").reset_index(drop=True)
+        assert result_old["a"].tolist() == [1, 2]
+
+    def test_duckdb_changes_type_we_read(self, make_write_catalog):
+        """DuckDB changes the type, we read correctly."""
+        cat = make_write_catalog()
+
+        # Create and populate via DuckDB
+        if cat.backend == "sqlite":
+            source = f"ducklake:sqlite:{cat.metadata_path}"
+        else:
+            source = f"ducklake:postgres:{cat.metadata_path}"
+
+        con = duckdb.connect()
+        con.install_extension("ducklake")
+        con.load_extension("ducklake")
+        con.execute(
+            f"ATTACH '{source}' AS ducklake "
+            f"(DATA_PATH '{cat.data_path}', DATA_INLINING_ROW_LIMIT 0)"
+        )
+        con.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR)")
+        con.execute("INSERT INTO ducklake.test VALUES (1, 'hello'), (2, 'world')")
+        con.execute("ALTER TABLE ducklake.test ALTER COLUMN a SET DATA TYPE BIGINT")
+        con.close()
+
+        # Read with ducklake-pandas
+        result = read_ducklake(cat.metadata_path, "test").sort_values("a").reset_index(drop=True)
+        assert result["a"].tolist() == [1, 2]
+        assert result["b"].tolist() == ["hello", "world"]
+
+    def test_we_change_type_duckdb_reads(self, make_write_catalog):
+        """We change the type, DuckDB reads correctly."""
+        cat = make_write_catalog()
+        df = pd.DataFrame({"a": np.array([1, 2], dtype=np.int32), "b": ["x", "y"]})
+        write_ducklake(df, cat.metadata_path, "test", mode="error")
+
+        alter_ducklake_set_type(cat.metadata_path, "test", "a", "BIGINT")
+
+        # Read with DuckDB
+        result = cat.read_with_duckdb("test")
+        assert sorted(result["a"].tolist()) == [1, 2]
+        assert sorted(result["b"].tolist()) == ["x", "y"]
