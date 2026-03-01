@@ -2,24 +2,46 @@
 
 > **This project is a proof of concept. It was 100% written by [Claude Code](https://docs.anthropic.com/en/docs/build-with-claude/claude-code/overview) (Anthropic's AI coding agent). It is not intended for production use.**
 
-A pure-Python [Polars](https://pola.rs/) integration for [DuckLake](https://ducklake.select/) catalogs — both read and write.
+Pure-Python [Polars](https://pola.rs/) and [Pandas](https://pandas.pydata.org/) integration for [DuckLake](https://ducklake.select/) catalogs — both read and write.
 
-Reads and writes DuckLake metadata directly from SQLite or PostgreSQL and scans the underlying Parquet data files through Polars' native Parquet reader. **No DuckDB runtime dependency.** You get lazy evaluation, predicate pushdown, projection pushdown, file pruning, and all other Polars optimizations out of the box.
+Reads and writes DuckLake metadata directly from SQLite or PostgreSQL and scans the underlying Parquet data files through Polars' native Parquet reader or PyArrow. **No DuckDB runtime dependency.** With Polars you get lazy evaluation, predicate pushdown, projection pushdown, file pruning, and all other Polars optimizations out of the box. With Pandas you get familiar DataFrame ergonomics.
+
+## Architecture
+
+The project uses a three-layer architecture with a shared core:
+
+```
+┌─────────────────┐  ┌─────────────────┐
+│  ducklake_polars │  │  ducklake_pandas │   ← Thin wrappers (API + reader)
+└────────┬────────┘  └────────┬────────┘
+         │                    │
+         └────────┬───────────┘
+                  │
+         ┌────────▼────────┐
+         │   ducklake_core  │   ← Shared engine (catalog, writer, schema, backend)
+         └─────────────────┘
+```
+
+- **`ducklake_core`** — All catalog I/O, write operations, schema mapping, and backend adapters. Uses [PyArrow](https://arrow.apache.org/docs/python/) as the internal data representation. Both Polars and Pandas wrappers delegate to this shared core for writes, DDL, and catalog inspection.
+- **`ducklake_polars`** — Polars-specific reader (lazy `scan_parquet` via the `PythonDatasetProvider` interface), plus a thin API layer that converts between Polars types and Arrow.
+- **`ducklake_pandas`** — Pandas-specific reader (eager reads via PyArrow → Pandas conversion), plus a thin API layer that converts between Pandas types and Arrow.
 
 ## Installation
 
 ```bash
-pip install ducklake-polars
+pip install ducklake-polars    # Polars integration
+pip install ducklake-pandas    # Pandas integration
 
 # With PostgreSQL catalog support
 pip install ducklake-polars[postgres]
+pip install ducklake-pandas[postgres]
 ```
 
-The only runtime dependency is `polars >= 1.0`. SQLite catalogs use Python's built-in `sqlite3`. PostgreSQL catalogs require the `postgres` extra (adds `psycopg2`).
+Runtime dependencies: `polars >= 1.0` and/or `pandas`, plus `pyarrow` (used by the core engine for Parquet I/O, schema mapping, and data processing). SQLite catalogs use Python's built-in `sqlite3`. PostgreSQL catalogs require the `postgres` extra (adds `psycopg2`).
 
 ## Quick start
 
-### Reading data
+### Reading data — Polars
 
 ```python
 import polars as pl
@@ -40,12 +62,49 @@ df = read_ducklake("catalog.ducklake", "my_table", snapshot_time="2025-01-15T10:
 df = read_ducklake("postgresql://user:pass@localhost/mydb", "my_table")
 ```
 
-### Writing data
+### Reading data — Pandas
 
 ```python
+from ducklake_pandas import read_ducklake
+
+# Eager read
+df = read_ducklake("catalog.ducklake", "my_table")
+
+# Column selection
+df = read_ducklake("catalog.ducklake", "my_table", columns=["id", "name"])
+
+# Time travel
+df = read_ducklake("catalog.ducklake", "my_table", snapshot_version=3)
+
+# PostgreSQL-backed catalog
+df = read_ducklake("postgresql://user:pass@localhost/mydb", "my_table")
+```
+
+### Writing data — Polars
+
+```python
+import polars as pl
 from ducklake_polars import write_ducklake
 
 df = pl.DataFrame({"id": [1, 2, 3], "name": ["Alice", "Bob", "Carol"]})
+
+# Create and populate a new table
+write_ducklake(df, "catalog.ducklake", "users", mode="error")
+
+# Append rows
+write_ducklake(new_rows, "catalog.ducklake", "users", mode="append")
+
+# Overwrite all data
+write_ducklake(df, "catalog.ducklake", "users", mode="overwrite")
+```
+
+### Writing data — Pandas
+
+```python
+import pandas as pd
+from ducklake_pandas import write_ducklake
+
+df = pd.DataFrame({"id": [1, 2, 3], "name": ["Alice", "Bob", "Carol"]})
 
 # Create and populate a new table
 write_ducklake(df, "catalog.ducklake", "users", mode="error")
@@ -96,7 +155,7 @@ create_ducklake_view("catalog.ducklake", "active_users", "SELECT * FROM users WH
 drop_ducklake_view("catalog.ducklake", "active_users")
 ```
 
-### DML operations
+### DML operations — Polars
 
 ```python
 from ducklake_polars import delete_ducklake, update_ducklake, merge_ducklake
@@ -109,6 +168,32 @@ updated = update_ducklake(
     "catalog.ducklake", "users",
     updates={"status": "inactive"},
     predicate=pl.col("last_login") < "2024-01-01",
+)
+
+# Merge (upsert)
+rows_updated, rows_inserted = merge_ducklake(
+    "catalog.ducklake", "users", source_df, on="id",
+    when_matched_update=True,
+    when_not_matched_insert=True,
+)
+```
+
+### DML operations — Pandas
+
+```python
+from ducklake_pandas import delete_ducklake, update_ducklake, merge_ducklake
+
+# Delete rows matching a predicate (predicate is a callable)
+deleted = delete_ducklake(
+    "catalog.ducklake", "users",
+    lambda df: df["active"] == False,
+)
+
+# Update rows
+updated = update_ducklake(
+    "catalog.ducklake", "users",
+    updates={"status": "inactive"},
+    predicate=lambda df: df["last_login"] < "2024-01-01",
 )
 
 # Merge (upsert)
@@ -261,18 +346,28 @@ See the [DuckDB Interop Guide](https://github.com/pdet/ducklake-polars/wiki/Duck
 | `GEOMETRY` | `Binary` | |
 | `VARIANT` | `String` | |
 
-## Architecture
+## Package Structure
 
 ```
-src/ducklake_polars/
-    __init__.py       Public API (all functions and DuckLakeCatalog)
-    _backend.py       Backend adapters (SQLite, PostgreSQL)
-    _catalog.py       Metadata reader (snapshots, tables, columns, files, stats)
-    _catalog_api.py   DuckLakeCatalog inspection class
-    _dataset.py       Polars PythonDatasetProvider implementation
-    _schema.py        DuckLake type -> Polars type mapping
-    _stats.py         Column statistics for file pruning
-    _writer.py        Catalog writer (tables, data, DDL, views, maintenance)
+src/
+├── ducklake_core/             Shared engine (Arrow-based internals)
+│   ├── _backend.py            Backend adapters (SQLite, PostgreSQL)
+│   ├── _catalog.py            Metadata reader (snapshots, tables, columns, files, stats)
+│   ├── _catalog_api.py        DuckLakeCatalog inspection class (returns pa.Table)
+│   ├── _schema.py             DuckDB type ↔ Arrow type mapping
+│   └── _writer.py             Catalog writer (all DDL, DML, maintenance)
+├── ducklake_polars/           Polars wrapper
+│   ├── __init__.py            Public API (scan/read/write/DDL/DML)
+│   ├── _catalog.py            Polars-specific catalog reader (delegates to core)
+│   ├── _catalog_api.py        DuckLakeCatalog returning Polars DataFrames
+│   ├── _dataset.py            PythonDatasetProvider (lazy scan_parquet)
+│   ├── _schema.py             DuckDB type → Polars type mapping
+│   ├── _stats.py              Column statistics for Polars file pruning
+│   └── _writer.py             Thin wrapper over core writer
+└── ducklake_pandas/           Pandas wrapper
+    ├── __init__.py            Public API (read/write/DDL/DML)
+    ├── _catalog_api.py        DuckLakeCatalog returning Pandas DataFrames
+    └── _writer.py             Thin wrapper over core writer
 ```
 
 See the [Architecture Overview](https://github.com/pdet/ducklake-polars/wiki/Architecture) for a detailed deep-dive.
@@ -296,7 +391,7 @@ pytest -k "test_views"    # Specific pattern
 DUCKLAKE_PG_DSN="postgresql://user:pass@localhost/testdb" pytest
 ```
 
-Test suite: **590 tests** (5 xfailed for known DuckDB/Polars limitations). Tests are parametrized over backends — SQLite always runs; PostgreSQL runs when `DUCKLAKE_PG_DSN` is set.
+Test suite: **590+ tests** (5 xfailed for known DuckDB/Polars limitations). Tests are parametrized over backends — SQLite always runs; PostgreSQL runs when `DUCKLAKE_PG_DSN` is set. Both Polars and Pandas wrappers are tested for interoperability with DuckDB's native extension.
 
 ## Documentation
 
