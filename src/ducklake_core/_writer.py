@@ -326,12 +326,30 @@ class DuckLakeCatalogWriter:
         self._author = author
         self._commit_message = commit_message
         self._con: Any = None
+        self._catalog_version: str | None = None
+
+    @property
+    def _is_v04(self) -> bool:
+        """True when the catalog is version 0.4 or later."""
+        return self._catalog_version is not None and self._catalog_version >= "0.4"
 
     def _connect(self) -> Any:
         if self._con is None:
             raw = self._backend.connect_writable()
             self._con = _PlaceholderConnection(raw, self._backend.placeholder)
+            self._detect_catalog_version()
         return self._con
+
+    def _detect_catalog_version(self) -> None:
+        """Read the catalog version from ducklake_metadata."""
+        try:
+            row = self._con.execute(
+                "SELECT value FROM ducklake_metadata WHERE key = 'version'"
+            ).fetchone()
+            if row is not None:
+                self._catalog_version = row[0]
+        except Exception:
+            pass
 
     def close(self) -> None:
         if self._con is not None:
@@ -380,6 +398,24 @@ class DuckLakeCatalogWriter:
             [new_id, now, schema_version, next_catalog_id, next_file_id],
         )
         return new_id
+
+    def _insert_schema_version(
+        self, snapshot_id: int, schema_version: int, table_id: int | None = None
+    ) -> None:
+        """Insert a schema version record, version-aware."""
+        con = self._connect()
+        if self._is_v04:
+            con.execute(
+                "INSERT INTO ducklake_schema_versions "
+                "(begin_snapshot, schema_version, table_id) VALUES (?, ?, ?)",
+                [snapshot_id, schema_version, table_id],
+            )
+        else:
+            con.execute(
+                "INSERT INTO ducklake_schema_versions "
+                "(begin_snapshot, schema_version) VALUES (?, ?)",
+                [snapshot_id, schema_version],
+            )
 
     def _record_change(
         self,
@@ -851,8 +887,12 @@ class DuckLakeCatalogWriter:
                 "INSERT INTO ducklake_column "
                 "(column_id, begin_snapshot, end_snapshot, table_id, column_order, "
                 "column_name, column_type, initial_default, default_value, "
-                "nulls_allowed, parent_column) "
-                "VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+                "nulls_allowed, parent_column" + (
+                    ", default_value_type, default_value_dialect) "
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?, 'literal', NULL)"
+                    if self._is_v04 else
+                    ") VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?)"
+                ),
                 [
                     cd.column_id,
                     new_snap,
@@ -865,11 +905,7 @@ class DuckLakeCatalogWriter:
                 ],
             )
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         safe_schema = schema_name.replace('"', '""')
         safe_table = table_name.replace('"', '""')
@@ -950,8 +986,12 @@ class DuckLakeCatalogWriter:
                 "INSERT INTO ducklake_column "
                 "(column_id, begin_snapshot, end_snapshot, table_id, column_order, "
                 "column_name, column_type, initial_default, default_value, "
-                "nulls_allowed, parent_column) "
-                "VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+                "nulls_allowed, parent_column" + (
+                    ", default_value_type, default_value_dialect) "
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?, 'literal', NULL)"
+                    if self._is_v04 else
+                    ") VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?)"
+                ),
                 [
                     cd.column_id,
                     new_snap,
@@ -964,11 +1004,7 @@ class DuckLakeCatalogWriter:
                 ],
             )
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         if has_data:
             if inline_data:
@@ -1192,8 +1228,11 @@ class DuckLakeCatalogWriter:
             "(data_file_id, table_id, begin_snapshot, end_snapshot, file_order, "
             "path, path_is_relative, file_format, record_count, file_size_bytes, "
             "footer_size, row_id_start, partition_id, encryption_key, "
-            "partial_file_info, mapping_id) "
-            "VALUES (?, ?, ?, NULL, NULL, ?, ?, 'parquet', ?, ?, ?, ?, ?, NULL, NULL, ?)",
+            + ("mapping_id, partial_max) "
+               "VALUES (?, ?, ?, NULL, NULL, ?, ?, 'parquet', ?, ?, ?, ?, ?, NULL, ?, NULL)"
+               if self._is_v04 else
+               "partial_file_info, mapping_id) "
+               "VALUES (?, ?, ?, NULL, NULL, ?, ?, 'parquet', ?, ?, ?, ?, ?, NULL, NULL, ?)"),
             [
                 data_file_id,
                 table_id,
@@ -2869,19 +2908,19 @@ class DuckLakeCatalogWriter:
             "INSERT INTO ducklake_column "
             "(column_id, begin_snapshot, end_snapshot, table_id, column_order, "
             "column_name, column_type, initial_default, default_value, "
-            "nulls_allowed, parent_column) "
-            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            "nulls_allowed, parent_column" + (
+                ", default_value_type, default_value_dialect) "
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, 'literal', NULL)"
+                if self._is_v04 else
+                ") VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL)"
+            ),
             [
                 new_col_id, new_snap, table_id, new_col_order,
                 column_name, duckdb_type, default_str, default_str, True,
             ],
         )
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
@@ -2948,8 +2987,12 @@ class DuckLakeCatalogWriter:
             "INSERT INTO ducklake_column "
             "(column_id, begin_snapshot, end_snapshot, table_id, column_order, "
             "column_name, column_type, initial_default, default_value, "
-            "nulls_allowed, parent_column) "
-            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "nulls_allowed, parent_column" + (
+                ", default_value_type, default_value_dialect) "
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'literal', NULL)"
+                if self._is_v04 else
+                ") VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
             [
                 col_id, new_snap, table_id, col_order,
                 new_column_name, col_type, initial_default, default_value,
@@ -2957,11 +3000,7 @@ class DuckLakeCatalogWriter:
             ],
         )
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
@@ -3048,8 +3087,12 @@ class DuckLakeCatalogWriter:
             "INSERT INTO ducklake_column "
             "(column_id, begin_snapshot, end_snapshot, table_id, column_order, "
             "column_name, column_type, initial_default, default_value, "
-            "nulls_allowed, parent_column) "
-            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "nulls_allowed, parent_column" + (
+                ", default_value_type, default_value_dialect) "
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'literal', NULL)"
+                if self._is_v04 else
+                ") VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
             [
                 col_id, new_snap, table_id, col_order,
                 column_name, duckdb_new_type, initial_default, default_value,
@@ -3057,11 +3100,7 @@ class DuckLakeCatalogWriter:
             ],
         )
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
@@ -3111,11 +3150,7 @@ class DuckLakeCatalogWriter:
         self._end_all_delete_files(table_id, snap_id, new_snap)
         self._end_all_inlined_rows(table_id, snap_id, new_snap)
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         self._record_change(new_snap, f"dropped_table:{table_id}")
 
@@ -3166,11 +3201,7 @@ class DuckLakeCatalogWriter:
             [schema_id, schema_uuid, new_snap, schema_name, schema_path, True],
         )
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, None)
 
         safe_schema = schema_name.replace('"', '""')
         self._record_change(new_snap, f'created_schema:"{safe_schema}"')
@@ -3245,11 +3276,7 @@ class DuckLakeCatalogWriter:
         )
         changes.append(f"dropped_schema:{schema_id}")
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, None)
 
         schema_changes = [c for c in changes if c.startswith("dropped_schema")]
         table_changes = [c for c in changes if c.startswith("dropped_table")]
@@ -3312,11 +3339,7 @@ class DuckLakeCatalogWriter:
              new_table_name, table_path, path_is_relative],
         )
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         safe_schema = schema_name.replace('"', '""')
         safe_table = new_table_name.replace('"', '""')
@@ -3387,11 +3410,7 @@ class DuckLakeCatalogWriter:
 
         self._end_descendant_columns(table_id, target_col_id, new_snap)
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
@@ -3480,11 +3499,7 @@ class DuckLakeCatalogWriter:
                 [partition_id, table_id, key_index, col_id],
             )
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
@@ -3515,23 +3530,30 @@ class DuckLakeCatalogWriter:
             "null_order VARCHAR)"
         )
 
+    def _sort_tables_exist(self) -> bool:
+        """Check if sort tables exist without triggering Postgres rollback."""
+        con = self._connect()
+        try:
+            return self._backend.table_exists(con, "ducklake_sort_info")
+        except Exception:
+            return False
+
     def _get_active_sort_keys(
         self, table_id: int, snapshot_id: int
-    ) -> list[tuple[str, str]] | None:
-        """Return active sort keys as [(column_name, direction)] or None.
+    ) -> list[tuple[str, str, str]] | None:
+        """Return active sort keys as [(column_name, direction, null_order)] or None.
 
         Returns None if no sort keys are defined for the table.
         """
-        con = self._connect()
-        try:
-            row = con.execute(
-                "SELECT sort_id FROM ducklake_sort_info "
-                "WHERE table_id = ? AND begin_snapshot <= ? "
-                "AND (end_snapshot IS NULL OR end_snapshot > ?)",
-                [table_id, snapshot_id, snapshot_id],
-            ).fetchone()
-        except Exception:
+        if not self._sort_tables_exist():
             return None
+        con = self._connect()
+        row = con.execute(
+            "SELECT sort_id FROM ducklake_sort_info "
+            "WHERE table_id = ? AND begin_snapshot <= ? "
+            "AND (end_snapshot IS NULL OR end_snapshot > ?)",
+            [table_id, snapshot_id, snapshot_id],
+        ).fetchone()
         if row is None:
             return None
 
@@ -3540,10 +3562,11 @@ class DuckLakeCatalogWriter:
         # Get column names from sort expressions
         columns = self._get_columns_for_table(table_id, snapshot_id)
         col_id_to_name: dict[str, str] = {str(c[0]): c[1] for c in columns}
+        col_names_set = {c[1] for c in columns}
 
         try:
             rows = con.execute(
-                "SELECT sort_key_index, expression, sort_direction "
+                "SELECT sort_key_index, expression, sort_direction, null_order "
                 "FROM ducklake_sort_expression "
                 "WHERE sort_id = ? AND table_id = ? "
                 "ORDER BY sort_key_index",
@@ -3553,22 +3576,34 @@ class DuckLakeCatalogWriter:
             return None
 
         result = []
-        for _idx, expr, direction in rows:
-            col_name = col_id_to_name.get(expr)
+        for _idx, expr, direction, null_order in rows:
+            # expression can be column name (v1.5) or column ID (legacy)
+            if expr in col_names_set:
+                col_name = expr
+            else:
+                col_name = col_id_to_name.get(expr)
             if col_name is None:
                 continue
-            result.append((col_name, direction or "asc"))
+            direction = (direction or "ASC").upper()
+            null_order = (null_order or "NULLS_LAST").upper()
+            result.append((col_name, direction, null_order))
 
         return result if result else None
 
     def _sort_table_by_keys(
-        self, df: pa.Table, sort_keys: list[tuple[str, str]]
+        self, df: pa.Table, sort_keys: list[tuple[str, str, str]]
     ) -> pa.Table:
-        """Sort an Arrow table by the given sort keys."""
+        """Sort an Arrow table by the given sort keys.
+
+        Each key is ``(column_name, direction, null_order)`` where
+        *direction* is ``ASC``/``DESC`` and *null_order* is
+        ``NULLS_FIRST``/``NULLS_LAST``.
+        """
         sort_cols = []
-        for col_name, direction in sort_keys:
+        for col_name, direction, null_order in sort_keys:
             if col_name in df.schema.names:
-                sort_cols.append((col_name, "ascending" if direction == "asc" else "descending"))
+                order = "ascending" if direction.upper() == "ASC" else "descending"
+                sort_cols.append((col_name, order))
         if not sort_cols:
             return df
         indices = pc.sort_indices(df, sort_keys=sort_cols)
@@ -3578,7 +3613,6 @@ class DuckLakeCatalogWriter:
         self, df: pa.Table, table_id: int, snapshot_id: int
     ) -> pa.Table:
         """Sort *df* by the table's sort keys if any are defined."""
-        self._ensure_sort_tables()
         sort_keys = self._get_active_sort_keys(table_id, snapshot_id)
         if sort_keys:
             return self._sort_table_by_keys(df, sort_keys)
@@ -3587,13 +3621,19 @@ class DuckLakeCatalogWriter:
     def set_sort_keys(
         self,
         table_name: str,
-        column_names: list[str],
+        sort_keys: list[str | tuple[str, str] | tuple[str, str, str]],
         *,
         schema_name: str = "main",
     ) -> None:
         """Set sort keys on an existing table.
 
-        Equivalent to ``ALTER TABLE t SET SORTED BY (col1, col2, ...)``.
+        Equivalent to ``ALTER TABLE t SET SORTED BY (col1, col2 DESC, ...)``.
+
+        *sort_keys* accepts:
+        - ``"col"`` → ascending, nulls last
+        - ``("col", "DESC")`` → descending, nulls last
+        - ``("col", "ASC", "NULLS_FIRST")`` → ascending, nulls first
+
         Future writes will sort data by these columns before writing
         Parquet files, improving filter pushdown via row group statistics.
         """
@@ -3608,11 +3648,29 @@ class DuckLakeCatalogWriter:
             raise ValueError(msg)
 
         columns = self._get_columns_for_table(table_id, snap_id)
-        col_name_to_id: dict[str, int] = {c[1]: c[0] for c in columns}
-        for name in column_names:
-            if name not in col_name_to_id:
+        col_names_set = {c[1] for c in columns}
+
+        # Normalise sort_keys into (name, direction, null_order) triples
+        normalised: list[tuple[str, str, str]] = []
+        for key in sort_keys:
+            if isinstance(key, str):
+                name, direction, null_order = key, "ASC", "NULLS_LAST"
+            elif len(key) == 2:
+                name, direction = key[0], key[1].upper()
+                null_order = "NULLS_LAST"
+            else:
+                name, direction, null_order = key[0], key[1].upper(), key[2].upper()
+
+            if name not in col_names_set:
                 msg = f"Column '{name}' not found in '{schema_name}.{table_name}'"
                 raise ValueError(msg)
+            if direction not in ("ASC", "DESC"):
+                msg = f"Invalid sort direction '{direction}'; expected ASC or DESC"
+                raise ValueError(msg)
+            if null_order not in ("NULLS_FIRST", "NULLS_LAST"):
+                msg = f"Invalid null order '{null_order}'; expected NULLS_FIRST or NULLS_LAST"
+                raise ValueError(msg)
+            normalised.append((name, direction, null_order))
 
         sort_id = next_cat_id
         new_next_cat_id = next_cat_id + 1
@@ -3637,24 +3695,58 @@ class DuckLakeCatalogWriter:
             [sort_id, table_id, new_snap],
         )
 
-        for key_index, col_name in enumerate(column_names):
-            col_id = col_name_to_id[col_name]
+        for key_index, (col_name, direction, null_order) in enumerate(normalised):
             con.execute(
                 "INSERT INTO ducklake_sort_expression "
                 "(sort_id, table_id, sort_key_index, expression, dialect, "
                 "sort_direction, null_order) "
-                "VALUES (?, ?, ?, ?, 'duckdb', 'asc', 'nulls_last')",
-                [sort_id, table_id, key_index, str(col_id)],
+                "VALUES (?, ?, ?, ?, 'duckdb', ?, ?)",
+                [sort_id, table_id, key_index, col_name, direction, null_order],
             )
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
+        con.commit()
+
+    def reset_sort_keys(
+        self,
+        table_name: str,
+        *,
+        schema_name: str = "main",
+    ) -> None:
+        """Remove sort keys from a table.
+
+        Equivalent to ``ALTER TABLE t RESET SORTED BY``.
+        """
+        con = self._connect()
+        self._ensure_sort_tables()
+
+        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+
+        table_id = self._table_exists(table_name, schema_name, snap_id)
+        if table_id is None:
+            msg = f"Table '{schema_name}.{table_name}' not found"
+            raise ValueError(msg)
+
+        # Check if there are active sort keys
+        existing = self._get_active_sort_keys(table_id, snap_id)
+        if existing is None:
+            return  # Nothing to reset
+
+        new_schema_ver = schema_ver + 1
+        new_snap = self._create_snapshot(new_schema_ver, next_cat_id, next_file_id)
+
+        con.execute(
+            "UPDATE ducklake_sort_info SET end_snapshot = ? "
+            "WHERE table_id = ? AND end_snapshot IS NULL",
+            [new_snap, table_id],
+        )
+
+        self._insert_schema_version(new_snap, new_schema_ver, table_id)
+
+        self._record_change(new_snap, f"altered_table:{table_id}")
         con.commit()
 
     # ------------------------------------------------------------------
@@ -4087,11 +4179,7 @@ class DuckLakeCatalogWriter:
         safe_view = view_name.replace('"', '""')
         changes.append(f'created_view:"{safe_schema}"."{safe_view}"')
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, None)
 
         self._record_change(new_snap, ",".join(changes))
 
@@ -4127,11 +4215,7 @@ class DuckLakeCatalogWriter:
             [new_snap, view_id],
         )
 
-        con.execute(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) "
-            "VALUES (?, ?)",
-            [new_snap, new_schema_ver],
-        )
+        self._insert_schema_version(new_snap, new_schema_ver, None)
 
         self._record_change(new_snap, f"dropped_view:{view_id}")
 

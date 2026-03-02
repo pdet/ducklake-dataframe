@@ -29,6 +29,14 @@ class SQLiteBackend:
         """Check if an exception indicates a missing table."""
         return isinstance(exc, sqlite3.OperationalError) and "no such table" in str(exc)
 
+    def table_exists(self, con: Any, table_name: str) -> bool:
+        """Check if a table exists in the SQLite database."""
+        row = con.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            [table_name],
+        ).fetchone()
+        return row is not None and row[0] > 0
+
 
 class _PsycopgConnectionWrapper:
     """
@@ -115,6 +123,15 @@ class PostgreSQLBackend:
         except ImportError:
             return False
         return isinstance(exc, psycopg2.ProgrammingError) and getattr(exc, "pgcode", None) == "42P01"
+
+    def table_exists(self, con: Any, table_name: str) -> bool:
+        """Check if a table exists in the Postgres database."""
+        row = con.execute(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_name = %s",
+            [table_name],
+        ).fetchone()
+        return row is not None and row[0] > 0
 
 
 class _DuckDBConnectionWrapper:
@@ -212,6 +229,14 @@ class DuckDBBackend:
         except ImportError:
             return False
         return isinstance(exc, duckdb.CatalogException) and "does not exist" in str(exc)
+
+    def table_exists(self, con: Any, table_name: str) -> bool:
+        """Check if a table exists in the DuckDB database."""
+        row = con.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?",
+            [table_name],
+        ).fetchone()
+        return row is not None and row[0] > 0
 
 
 def create_backend(path: str) -> SQLiteBackend | PostgreSQLBackend | DuckDBBackend:

@@ -27,6 +27,7 @@ __all__ = [
     "alter_ducklake_set_type",
     "alter_ducklake_set_partitioned_by",
     "alter_ducklake_set_sort_keys",
+    "alter_ducklake_reset_sort_keys",
     "drop_ducklake_table",
     "create_ducklake_schema",
     "drop_ducklake_schema",
@@ -313,11 +314,11 @@ def read_ducklake(
             for s in stats_list:
                 file_stats_map.setdefault(s.data_file_id, {})[s.column_id] = (s.min_value, s.max_value)
 
-        # Build delete file mapping: data_file_id -> list of (path, row_id_start)
-        del_map: dict[int, list[str]] = {}
+        # Build delete file mapping: data_file_id -> list of (path, partial_max)
+        del_map: dict[int, list[tuple[str, int | None]]] = {}
         for df in delete_files:
             del_path = reader.resolve_data_file_path(df.path, df.path_is_relative, table_info)
-            del_map.setdefault(df.data_file_id, []).append(del_path)
+            del_map.setdefault(df.data_file_id, []).append((del_path, df.partial_max))
 
         frames: list[pa.Table] = []
 
@@ -341,8 +342,23 @@ def read_ducklake(
             # Apply delete files (Iceberg position-delete format)
             if f.data_file_id in del_map:
                 all_positions: list[int] = []
-                for del_path in del_map[f.data_file_id]:
+                for del_path, partial_max in del_map[f.data_file_id]:
                     del_tbl = pq.read_table(del_path)
+                    # Filter cumulative delete files when time-traveling.
+                    # v0.4 catalogs tag each position with the snapshot that
+                    # deleted it via _ducklake_internal_snapshot_id.
+                    if (
+                        partial_max is not None
+                        and partial_max > snap.snapshot_id
+                        and "_ducklake_internal_snapshot_id" in del_tbl.column_names
+                    ):
+                        import pyarrow.compute as pc
+
+                        mask = pc.less_equal(
+                            del_tbl.column("_ducklake_internal_snapshot_id"),
+                            snap.snapshot_id,
+                        )
+                        del_tbl = del_tbl.filter(mask)
                     if "pos" in del_tbl.column_names:
                         positions = del_tbl.column("pos").to_pylist()
                         all_positions.extend(
@@ -484,6 +500,21 @@ def read_ducklake(
             column_names,
         )
         if inlined is not None and inlined.num_rows > 0:
+            # Cast inlined data to target schema (inlined values stored as strings)
+            cast_cols = []
+            for col_name in inlined.column_names:
+                col = inlined.column(col_name)
+                if col_name in arrow_schema.names:
+                    target_type = arrow_schema.field(col_name).type
+                    if col.type != target_type:
+                        try:
+                            col = col.cast(target_type, safe=False)
+                        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                            pass
+                cast_cols.append(col)
+            inlined = pa.table(
+                {name: col for name, col in zip(inlined.column_names, cast_cols)}
+            )
             frames.append(inlined)
 
     if not frames:
@@ -1071,7 +1102,7 @@ def alter_ducklake_set_partitioned_by(
 def alter_ducklake_set_sort_keys(
     path: str | Path,
     table: str,
-    column_names: list[str],
+    sort_keys: list[str | tuple[str, str] | tuple[str, str, str]],
     *,
     schema: str = "main",
     data_path: str | Path | None = None,
@@ -1081,7 +1112,7 @@ def alter_ducklake_set_sort_keys(
     """
     Set sort keys on a DuckLake table.
 
-    Equivalent to ``ALTER TABLE t SET SORTED BY (col1, col2, ...)``.
+    Equivalent to ``ALTER TABLE t SET SORTED BY (col1, col2 DESC, ...)``.
     Future writes will sort data by these columns before writing Parquet
     files, improving filter pushdown via Parquet row group statistics.
 
@@ -1092,8 +1123,12 @@ def alter_ducklake_set_sort_keys(
         Supports SQLite and PostgreSQL backends.
     table
         Name of the table.
-    column_names
-        Column names to sort by (ascending order).
+    sort_keys
+        Sort key specifications. Each element can be:
+
+        - ``"col"`` — ascending, nulls last
+        - ``("col", "DESC")`` — descending, nulls last
+        - ``("col", "ASC", "NULLS_FIRST")`` — ascending, nulls first
     schema
         Schema name (default: "main").
     data_path
@@ -1113,7 +1148,33 @@ def alter_ducklake_set_sort_keys(
         metadata_path, data_path_override=dp,
         author=author, commit_message=commit_message,
     ) as writer:
-        writer.set_sort_keys(table, column_names, schema_name=schema)
+        writer.set_sort_keys(table, sort_keys, schema_name=schema)
+
+
+def alter_ducklake_reset_sort_keys(
+    path: str | Path,
+    table: str,
+    *,
+    schema: str = "main",
+    data_path: str | Path | None = None,
+    author: str | None = None,
+    commit_message: str | None = None,
+) -> None:
+    """
+    Remove sort keys from a DuckLake table.
+
+    Equivalent to ``ALTER TABLE t RESET SORTED BY``.
+    """
+    from ducklake_pandas._writer import DuckLakeCatalogWriter
+
+    metadata_path = os.fspath(path)
+    dp = os.fspath(data_path) if data_path is not None else None
+
+    with DuckLakeCatalogWriter(
+        metadata_path, data_path_override=dp,
+        author=author, commit_message=commit_message,
+    ) as writer:
+        writer.reset_sort_keys(table, schema_name=schema)
 
 
 def alter_ducklake_set_type(
