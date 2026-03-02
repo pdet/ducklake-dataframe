@@ -3530,6 +3530,14 @@ class DuckLakeCatalogWriter:
             "null_order VARCHAR)"
         )
 
+    def _sort_tables_exist(self) -> bool:
+        """Check if sort tables exist without triggering Postgres rollback."""
+        con = self._connect()
+        try:
+            return self._backend.table_exists(con, "ducklake_sort_info")
+        except Exception:
+            return False
+
     def _get_active_sort_keys(
         self, table_id: int, snapshot_id: int
     ) -> list[tuple[str, str, str]] | None:
@@ -3537,16 +3545,15 @@ class DuckLakeCatalogWriter:
 
         Returns None if no sort keys are defined for the table.
         """
-        con = self._connect()
-        try:
-            row = con.execute(
-                "SELECT sort_id FROM ducklake_sort_info "
-                "WHERE table_id = ? AND begin_snapshot <= ? "
-                "AND (end_snapshot IS NULL OR end_snapshot > ?)",
-                [table_id, snapshot_id, snapshot_id],
-            ).fetchone()
-        except Exception:
+        if not self._sort_tables_exist():
             return None
+        con = self._connect()
+        row = con.execute(
+            "SELECT sort_id FROM ducklake_sort_info "
+            "WHERE table_id = ? AND begin_snapshot <= ? "
+            "AND (end_snapshot IS NULL OR end_snapshot > ?)",
+            [table_id, snapshot_id, snapshot_id],
+        ).fetchone()
         if row is None:
             return None
 
@@ -3606,7 +3613,6 @@ class DuckLakeCatalogWriter:
         self, df: pa.Table, table_id: int, snapshot_id: int
     ) -> pa.Table:
         """Sort *df* by the table's sort keys if any are defined."""
-        self._ensure_sort_tables()
         sort_keys = self._get_active_sort_keys(table_id, snapshot_id)
         if sort_keys:
             return self._sort_table_by_keys(df, sort_keys)
