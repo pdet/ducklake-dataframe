@@ -13,8 +13,6 @@ from typing import Any, Callable
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
-
 import ducklake_core._storage as storage
 from ducklake_core._backend import PostgreSQLBackend, SQLiteBackend, create_backend
 from ducklake_core._schema import arrow_type_to_duckdb, duckdb_type_to_arrow
@@ -1967,9 +1965,9 @@ class DuckLakeCatalogWriter:
                 schema_path, schema_path_rel,
             )
             try:
-                del_table = pq.ParquetFile(abs_del).read()
+                del_table = storage.read_parquet(abs_del)
                 positions.update(del_table.column("pos").to_pylist())
-            except Exception:
+            except (OSError, FileNotFoundError):
                 pass
 
         return positions
@@ -1986,7 +1984,7 @@ class DuckLakeCatalogWriter:
         schema_path_rel: bool,
     ) -> pa.Table:
         """Read a data file and exclude rows covered by active delete files."""
-        df = pq.ParquetFile(abs_path).read()
+        df = storage.read_parquet(abs_path)
         deleted_positions = self._get_active_delete_positions(
             data_file_id, table_id, snapshot_id,
             table_path, table_path_rel, schema_path, schema_path_rel,
@@ -2104,7 +2102,7 @@ class DuckLakeCatalogWriter:
                     table_path, table_path_rel,
                     schema_path, schema_path_rel,
                 )
-                raw_df = pq.ParquetFile(abs_path).read()
+                raw_df = storage.read_parquet(abs_path)
                 already_deleted = self._get_active_delete_positions(
                     data_file_id, table_id, snap_id,
                     table_path, table_path_rel, schema_path, schema_path_rel,
@@ -2273,7 +2271,7 @@ class DuckLakeCatalogWriter:
                 table_path, table_path_rel,
                 schema_path, schema_path_rel,
             )
-            raw_df = pq.ParquetFile(abs_path).read()
+            raw_df = storage.read_parquet(abs_path)
             already_deleted = self._get_active_delete_positions(
                 data_file_id, table_id, snap_id,
                 table_path, table_path_rel, schema_path, schema_path_rel,
@@ -2578,7 +2576,7 @@ class DuckLakeCatalogWriter:
                 table_path, table_path_rel,
                 schema_path, schema_path_rel,
             )
-            raw_df = pq.ParquetFile(abs_path).read()
+            raw_df = storage.read_parquet(abs_path)
             already_deleted = self._get_active_delete_positions(
                 data_file_id, table_id, snap_id,
                 table_path, table_path_rel, schema_path, schema_path_rel,
@@ -4045,15 +4043,6 @@ class DuckLakeCatalogWriter:
 
         referenced: set[str] = set()
 
-        schemas = con.execute(
-            "SELECT DISTINCT path, path_is_relative FROM ducklake_schema"
-        ).fetchall()
-        tables = con.execute(
-            "SELECT DISTINCT t.path, t.path_is_relative, s.path, s.path_is_relative "
-            "FROM ducklake_table t "
-            "JOIN ducklake_schema s ON t.schema_id = s.schema_id"
-        ).fetchall()
-
         data_base = self.data_path
 
         data_files = con.execute(
@@ -4070,7 +4059,7 @@ class DuckLakeCatalogWriter:
                 s_path or "", bool(s_rel) if s_rel is not None else True,
                 data_base,
             )
-            referenced.add(os.path.normpath(abs_path))
+            referenced.add(storage.normalize_path(abs_path))
 
         delete_files = con.execute(
             "SELECT df.path, df.path_is_relative, t.path, t.path_is_relative, "
@@ -4086,16 +4075,14 @@ class DuckLakeCatalogWriter:
                 s_path or "", bool(s_rel) if s_rel is not None else True,
                 data_base,
             )
-            referenced.add(os.path.normpath(abs_path))
+            referenced.add(storage.normalize_path(abs_path))
 
         deleted_count = 0
-        for dirpath, _dirnames, filenames in os.walk(data_base):
-            for fname in filenames:
-                if fname.endswith(".parquet"):
-                    full_path = os.path.normpath(os.path.join(dirpath, fname))
-                    if full_path not in referenced:
-                        os.remove(full_path)
-                        deleted_count += 1
+        all_parquet_files = storage.list_directory(data_base, suffix=".parquet")
+        for full_path in all_parquet_files:
+            if storage.normalize_path(full_path) not in referenced:
+                storage.delete_file(full_path)
+                deleted_count += 1
 
         return deleted_count
 
@@ -4233,11 +4220,11 @@ class DuckLakeCatalogWriter:
             return file_path
         base = data_base
         if schema_path_rel:
-            base = os.path.join(base, schema_path)
+            base = storage.join_path(base, schema_path)
         else:
             base = schema_path
         if table_path_rel:
-            base = os.path.join(base, table_path)
+            base = storage.join_path(base, table_path)
         else:
             base = table_path
-        return os.path.join(base, file_path)
+        return storage.join_path(base, file_path)

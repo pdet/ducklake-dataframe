@@ -1,8 +1,8 @@
 """Storage abstraction for local and remote (S3/GCS/Azure) file operations.
 
 All public functions transparently handle both local paths and remote URIs
-(``s3://``, ``gs://``, ``az://``) via *fsspec* when it is installed.
-For local-only usage, no extra dependencies are required.
+(``s3://``, ``gs://``, ``az://``, ``abfs://``, ``abfss://``) via *fsspec*
+when it is installed.  For local-only usage, no extra dependencies are required.
 """
 
 from __future__ import annotations
@@ -15,10 +15,13 @@ import pyarrow.parquet as pq
 if TYPE_CHECKING:
     import pyarrow as pa
 
+# Module-level cache for fsspec filesystem instances, keyed by protocol.
+_fs_cache: dict[str, object] = {}
+
 
 def _is_remote(path: str) -> bool:
     """Return True if *path* looks like a remote URI."""
-    return path.startswith(("s3://", "gs://", "az://", "abfs://"))
+    return path.startswith(("s3://", "gs://", "az://", "abfs://", "abfss://"))
 
 
 def _get_fs(path: str):
@@ -33,7 +36,10 @@ def _get_fs(path: str):
             "Install it with: pip install 'ducklake-polars[cloud]'"
         )
         raise ImportError(msg) from exc
-    return fsspec.filesystem(path.split("://")[0])
+    protocol = path.split("://")[0]
+    if protocol not in _fs_cache:
+        _fs_cache[protocol] = fsspec.filesystem(protocol)
+    return _fs_cache[protocol]
 
 
 # ------------------------------------------------------------------
@@ -108,3 +114,58 @@ def file_exists(path: str) -> bool:
     if fs is None:
         return os.path.exists(path)
     return fs.exists(path)
+
+
+def normalize_path(path: str) -> str:
+    """Normalize a path for consistent comparison.
+
+    For local paths uses ``os.path.normpath``.  For remote URIs collapses
+    duplicate slashes (preserving the ``protocol://`` prefix) and strips
+    trailing slashes.
+    """
+    if _is_remote(path):
+        protocol, rest = path.split("://", 1)
+        parts = [p for p in rest.split("/") if p]
+        return protocol + "://" + "/".join(parts)
+    return os.path.normpath(path)
+
+
+def list_directory(path: str, *, suffix: str | None = None) -> list[str]:
+    """Recursively list all files under *path*.
+
+    If *suffix* is given, only files ending with that suffix are returned.
+    Returns fully-qualified paths (absolute for local, full URI for remote).
+    """
+    fs = _get_fs(path)
+    if fs is None:
+        results: list[str] = []
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for fname in filenames:
+                if suffix is None or fname.endswith(suffix):
+                    results.append(os.path.normpath(os.path.join(dirpath, fname)))
+        return results
+    # Remote: use fsspec's find() for recursive listing
+    try:
+        all_files = fs.find(path)
+    except FileNotFoundError:
+        return []
+    protocol = path.split("://")[0]
+    results = []
+    for f in all_files:
+        full = f if f.startswith(protocol + "://") else protocol + "://" + f
+        if suffix is None or full.endswith(suffix):
+            results.append(full)
+    return results
+
+
+def delete_file(path: str) -> None:
+    """Delete a single file.
+
+    Raises ``FileNotFoundError`` if the file does not exist (local) or
+    the remote object is missing.
+    """
+    fs = _get_fs(path)
+    if fs is None:
+        os.remove(path)
+    else:
+        fs.rm(path)

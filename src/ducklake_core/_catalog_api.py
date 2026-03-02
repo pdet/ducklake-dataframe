@@ -7,8 +7,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
-
+import ducklake_core._storage as storage
 from ducklake_core._catalog import DuckLakeCatalogReader
 from ducklake_core._schema import resolve_column_type
 
@@ -502,7 +501,7 @@ class DuckLakeCatalog:
                 path = reader.resolve_data_file_path(
                     file_info.path, file_info.path_is_relative, table_info
                 )
-                df = pq.read_table(path)
+                df = storage.read_parquet(path)
                 # Only keep top-level columns that exist in the current schema
                 available = [c for c in column_names if c in df.column_names]
                 df = df.select(available)
@@ -557,7 +556,7 @@ class DuckLakeCatalog:
                 del_path = reader.resolve_data_file_path(
                     del_info.path, del_info.path_is_relative, table_info
                 )
-                del_df = pq.read_table(del_path)
+                del_df = storage.read_parquet(del_path)
 
                 # Get the corresponding data file
                 data_file = reader.get_data_file_by_id(del_info.data_file_id)
@@ -567,7 +566,7 @@ class DuckLakeCatalog:
                 data_path = reader.resolve_data_file_path(
                     data_file.path, data_file.path_is_relative, table_info
                 )
-                data_df = pq.read_table(data_path)
+                data_df = storage.read_parquet(data_path)
 
                 # Extract deleted row positions
                 # DuckLake delete files use Iceberg position-delete format
