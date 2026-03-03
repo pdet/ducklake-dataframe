@@ -94,6 +94,9 @@ class DuckLakeCatalogWriter:
         data_inlining_row_limit: int = 0,
         author: str | None = None,
         commit_message: str | None = None,
+        max_retries: int = 3,
+        retry_wait_ms: float = 100,
+        retry_backoff: float = 2.0,
     ) -> None:
         self._core = _CoreWriter(
             metadata_path,
@@ -101,6 +104,9 @@ class DuckLakeCatalogWriter:
             data_inlining_row_limit=data_inlining_row_limit,
             author=author,
             commit_message=commit_message,
+            max_retries=max_retries,
+            retry_wait_ms=retry_wait_ms,
+            retry_backoff=retry_backoff,
         )
 
     def __getattr__(self, name: str) -> Any:

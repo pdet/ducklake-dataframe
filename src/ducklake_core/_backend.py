@@ -21,9 +21,17 @@ class SQLiteBackend:
         return sqlite3.connect(f"file:{abs_path}?mode=ro", uri=True)
 
     def connect_writable(self) -> sqlite3.Connection:
-        """Open a read-write SQLite connection."""
+        """Open a read-write SQLite connection.
+
+        Uses manual transaction mode (isolation_level=None) so we can
+        issue explicit ``BEGIN IMMEDIATE`` before write operations to
+        acquire the write lock and prevent concurrent ID races.
+        """
         abs_path = os.path.abspath(self.path)
-        return sqlite3.connect(abs_path)
+        con = sqlite3.connect(abs_path, timeout=30)
+        con.isolation_level = None  # Manual transaction management
+        con.execute("BEGIN")
+        return con
 
     def is_table_not_found(self, exc: BaseException) -> bool:
         """Check if an exception indicates a missing table."""
