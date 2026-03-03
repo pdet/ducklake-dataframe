@@ -151,7 +151,7 @@ _Generated: 2026-03-01 · DuckLake spec version: 0.3_
 | LIST(T) | ✅ | ✅ Recursive | ✅ Recursive | ✅ Full |
 | STRUCT(...) | ✅ | ✅ Recursive | ✅ Recursive | ✅ Full |
 | MAP(K,V) | ✅ | ⚠️ List(Struct(key,value)) — Polars reader issue | ✅ via Arrow map_ | ⚠️ Partial |
-| UNION | ✅ | ❌ Not implemented | ❌ Not implemented | ❌ Missing |
+| UNION | ❌ Not in DuckLake | ❌ N/A | ❌ N/A | N/A |
 | ENUM | ✅ | ✅ (→ VARCHAR) | ✅ (→ VARCHAR) | ✅ Full |
 | GEOMETRY | ✅ | ✅ (Binary) | ✅ (Binary) | ✅ Full |
 | VARIANT | ✅ | ✅ (String) | ✅ (String) | ✅ Full |
@@ -203,8 +203,8 @@ _Generated: 2026-03-01 · DuckLake spec version: 0.3_
 | Feature | DuckDB ducklake | ducklake-dataframe | ducklake-pandas | Status |
 |---|---|---|---|---|
 | Author / commit message metadata | ✅ `ducklake_snapshot_changes` | ✅ `author=`, `commit_message=` | ✅ `author=`, `commit_message=` | ✅ Full |
-| Concurrent writes (transactions) | ✅ DuckDB transaction isolation | ❌ No conflict detection | ❌ No conflict detection | ❌ Missing |
-| Object storage (S3, GCS, Azure) | ✅ Via DuckDB httpfs/s3 | ❌ Local filesystem only | ❌ Local filesystem only | ❌ Missing |
+| Concurrent writes (transactions) | ✅ DuckDB transaction isolation | ✅ Optimistic concurrency | ✅ Optimistic concurrency | ✅ Done |
+| Object storage (S3, GCS, Azure) | ✅ Via DuckDB httpfs/s3 | ✅ Via fsspec | ✅ Via fsspec | ✅ Done |
 | Schema version tracking | ✅ `ducklake_schema_versions` | ✅ Read and written | ✅ Read and written | ✅ Full |
 
 ---
