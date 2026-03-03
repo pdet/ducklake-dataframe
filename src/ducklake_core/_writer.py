@@ -93,17 +93,28 @@ class _PlaceholderConnection:
 
     def commit(self) -> None:
         if hasattr(self._con, "isolation_level") and self._con.isolation_level is None:
-            # Manual transaction mode (SQLite) — explicit COMMIT + new txn
+            # Manual transaction mode (SQLite) — explicit COMMIT,
+            # then start a new deferred transaction (not IMMEDIATE)
+            # so we don't hold the write lock between operations.
             self._con.execute("COMMIT")
-            self._con.execute("BEGIN IMMEDIATE")
+            self._con.execute("BEGIN")
         elif hasattr(self._con, "commit"):
             self._con.commit()
+
+    def begin_immediate(self) -> None:
+        """Upgrade to an IMMEDIATE transaction (SQLite only)."""
+        if hasattr(self._con, "isolation_level") and self._con.isolation_level is None:
+            try:
+                self._con.execute("COMMIT")
+            except Exception:
+                pass
+            self._con.execute("BEGIN IMMEDIATE")
 
     def rollback(self) -> None:
         if hasattr(self._con, "isolation_level") and self._con.isolation_level is None:
             try:
                 self._con.execute("ROLLBACK")
-                self._con.execute("BEGIN IMMEDIATE")
+                self._con.execute("BEGIN")
             except Exception:
                 pass
         elif hasattr(self._con, "rollback"):
@@ -443,6 +454,10 @@ class DuckLakeCatalogWriter:
         self._txn_start_snapshot = None
         self._txn_conflict_tables = {}
 
+    def _acquire_write_lock(self) -> None:
+        """Upgrade to IMMEDIATE transaction on SQLite to hold the write lock."""
+        self._connect().begin_immediate()
+
     def _start_write_transaction(self, start_snapshot_id: int) -> None:
         """Begin tracking a write transaction for conflict detection."""
         self._txn_start_snapshot = start_snapshot_id
@@ -461,13 +476,6 @@ class DuckLakeCatalogWriter:
         """
         if table_id not in self._txn_conflict_tables:
             self._txn_conflict_tables[table_id] = operation
-
-    def _snapshot_tables_exist(self) -> bool:
-        """Check if snapshot tracking tables exist in the catalog."""
-        return (
-            self._backend.table_exists(self._connect()._con, "ducklake_snapshot")
-            and self._backend.table_exists(self._connect()._con, "ducklake_snapshot_changes")
-        )
 
     def _get_concurrent_changes(
         self, start_snapshot_id: int,
@@ -650,8 +658,12 @@ class DuckLakeCatalogWriter:
 
         Returns None if snapshot tables don't exist (v0.3 catalogs without
         snapshot tracking).
+
+        Acquires the write lock first (IMMEDIATE on SQLite) so the
+        returned IDs are safe from concurrent races.
         """
         con = self._connect()
+        self._acquire_write_lock()
         if not self._backend.table_exists(con._con, "ducklake_snapshot"):
             return None
         row = con.execute(
@@ -670,30 +682,22 @@ class DuckLakeCatalogWriter:
     ) -> int:
         """Create a new snapshot and return its ID.
 
-        Uses retry logic to handle concurrent snapshot creation (UNIQUE
-        constraint on snapshot_id).
+        The caller must hold the write lock (BEGIN IMMEDIATE on SQLite)
+        to prevent concurrent writers from generating the same ID.
         """
         con = self._connect()
-        for _attempt in range(10):
-            row = con.execute(
-                "SELECT COALESCE(MAX(snapshot_id), -1) + 1 FROM ducklake_snapshot"
-            ).fetchone()
-            new_id = row[0]
-            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f+00")
-            try:
-                con.execute(
-                    "INSERT INTO ducklake_snapshot "
-                    "(snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    [new_id, now, schema_version, next_catalog_id, next_file_id],
-                )
-                return new_id
-            except Exception:
-                # Concurrent writer got the same ID — retry with next
-                import time
-                time.sleep(0.01 * (_attempt + 1))
-        msg = "Failed to create snapshot after 10 retries"
-        raise RuntimeError(msg)
+        row = con.execute(
+            "SELECT COALESCE(MAX(snapshot_id), -1) + 1 FROM ducklake_snapshot"
+        ).fetchone()
+        new_id = row[0]
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f+00")
+        con.execute(
+            "INSERT INTO ducklake_snapshot "
+            "(snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [new_id, now, schema_version, next_catalog_id, next_file_id],
+        )
+        return new_id
 
     def _insert_schema_version(
         self, snapshot_id: int, schema_version: int, table_id: int | None = None

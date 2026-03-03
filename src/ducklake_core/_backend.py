@@ -24,14 +24,13 @@ class SQLiteBackend:
         """Open a read-write SQLite connection.
 
         Uses manual transaction mode (isolation_level=None) so we can
-        issue explicit ``BEGIN IMMEDIATE`` to acquire the write lock
-        before reading IDs, preventing concurrent UNIQUE constraint
-        violations.
+        issue explicit ``BEGIN IMMEDIATE`` before write operations to
+        acquire the write lock and prevent concurrent ID races.
         """
         abs_path = os.path.abspath(self.path)
         con = sqlite3.connect(abs_path, timeout=30)
         con.isolation_level = None  # Manual transaction management
-        con.execute("BEGIN IMMEDIATE")
+        con.execute("BEGIN")
         return con
 
     def is_table_not_found(self, exc: BaseException) -> bool:
