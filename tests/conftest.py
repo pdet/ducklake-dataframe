@@ -1,4 +1,4 @@
-"""Shared test fixtures for ducklake-polars tests."""
+"""Shared test fixtures for ducklake-dataframe tests."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class DuckLakeTestCatalog:
         catalog.execute("INSERT INTO ducklake.test VALUES (1)")
         catalog.close()  # Release the file lock
 
-        # Now read with ducklake-polars
+        # Now read with ducklake-dataframe
         result = read_ducklake(catalog.metadata_path, "test")
     """
 
@@ -147,7 +147,7 @@ def ducklake_catalog(request, tmp_path):
 
     Parametrized over available backends (always SQLite; PostgreSQL when
     ``DUCKLAKE_PG_DSN`` is set). The caller MUST call ``.close()`` before
-    reading with ducklake-polars to release the file lock.
+    reading with ducklake-dataframe to release the file lock.
     """
     backend = request.param
 
@@ -170,6 +170,29 @@ def ducklake_catalog(request, tmp_path):
     catalog.close()
     if backend == "postgres":
         catalog._cleanup_postgres_tables()
+
+
+@pytest.fixture
+def ducklake_catalog_sqlite(tmp_path):
+    """
+    Create a DuckLake catalog with SQLite backend only.
+
+    Used for tests that deadlock on Postgres (e.g., many sequential
+    DuckDB write operations on a Postgres-backed catalog).
+    """
+    metadata_path = str(tmp_path / "test.ducklake")
+    data_path = str(tmp_path / "data")
+
+    catalog = DuckLakeTestCatalog(
+        metadata_path=metadata_path,
+        data_path=data_path,
+        inline=False,
+        backend="sqlite",
+    )
+
+    yield catalog
+
+    catalog.close()
 
 
 @pytest.fixture(params=_get_backends())
