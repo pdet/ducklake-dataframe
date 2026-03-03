@@ -20,10 +20,12 @@ if TYPE_CHECKING:
     import pandas as pd
 
 from ducklake_pandas._catalog_api import DuckLakeCatalog
+from ducklake_core._writer import TransactionConflictError
 
 __all__ = [
     "read_ducklake",
     "write_ducklake",
+    "TransactionConflictError",
     "create_ducklake_table",
     "delete_ducklake",
     "update_ducklake",
@@ -607,7 +609,11 @@ def write_ducklake(
         author=author,
         commit_message=commit_message,
     ) as writer:
-        snap_id, _sv, _nci, _nfi = writer._get_latest_snapshot()
+        snapshot_info = writer._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id = -1
+        else:
+            snap_id, _sv, _nci, _nfi = snapshot_info
         table_id = writer._table_exists(table, schema, snap_id)
 
         if mode == "error":

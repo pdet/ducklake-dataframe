@@ -2,3 +2,4 @@
 
 from ducklake_core._catalog_api import DuckLakeCatalog as DuckLakeCatalog
 from ducklake_core._writer import DuckLakeCatalogWriter as DuckLakeCatalogWriter
+from ducklake_core._writer import TransactionConflictError as TransactionConflictError

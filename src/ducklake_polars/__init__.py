@@ -19,9 +19,11 @@ if TYPE_CHECKING:
 
     import polars as pl
 
+from ducklake_core._writer import TransactionConflictError
 from ducklake_polars._catalog_api import DuckLakeCatalog
 
 __all__ = [
+    "TransactionConflictError",
     "scan_ducklake",
     "read_ducklake",
     "write_ducklake",
@@ -183,6 +185,9 @@ def write_ducklake(
     data_inlining_row_limit: int = 0,
     author: str | None = None,
     commit_message: str | None = None,
+    max_retries: int = 3,
+    retry_wait_ms: float = 100,
+    retry_backoff: float = 2.0,
 ) -> None:
     """
     Write a Polars DataFrame to a DuckLake table.
@@ -234,8 +239,15 @@ def write_ducklake(
         data_inlining_row_limit=data_inlining_row_limit,
         author=author,
         commit_message=commit_message,
+        max_retries=max_retries,
+        retry_wait_ms=retry_wait_ms,
+        retry_backoff=retry_backoff,
     ) as writer:
-        snap_id, _sv, _nci, _nfi = writer._get_latest_snapshot()
+        snapshot_info = writer._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id = -1
+        else:
+            snap_id, _sv, _nci, _nfi = snapshot_info
         table_id = writer._table_exists(table, schema, snap_id)
 
         if mode == "error":

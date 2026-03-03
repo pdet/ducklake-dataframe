@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import time
 import uuid
@@ -10,6 +11,16 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
+
+
+class TransactionConflictError(Exception):
+    """Raised when a write conflicts with a concurrent transaction.
+
+    DuckLake uses optimistic concurrency control: transactions record
+    their starting snapshot and check for conflicting changes before
+    committing.  This exception is raised when a conflict is detected,
+    triggering automatic retry with exponential backoff.
+    """
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -81,8 +92,22 @@ class _PlaceholderConnection:
         return self._con.execute(sql)
 
     def commit(self) -> None:
-        if hasattr(self._con, "commit"):
+        if hasattr(self._con, "isolation_level") and self._con.isolation_level is None:
+            # Manual transaction mode (SQLite) — explicit COMMIT + new txn
+            self._con.execute("COMMIT")
+            self._con.execute("BEGIN IMMEDIATE")
+        elif hasattr(self._con, "commit"):
             self._con.commit()
+
+    def rollback(self) -> None:
+        if hasattr(self._con, "isolation_level") and self._con.isolation_level is None:
+            try:
+                self._con.execute("ROLLBACK")
+                self._con.execute("BEGIN IMMEDIATE")
+            except Exception:
+                pass
+        elif hasattr(self._con, "rollback"):
+            self._con.rollback()
 
     def close(self) -> None:
         self._con.close()
@@ -278,6 +303,32 @@ def _empty_like(table: pa.Table) -> pa.Table:
     )
 
 
+def _retryable(method):
+    """Decorator: retry a write method on :class:`TransactionConflictError`.
+
+    Uses the writer's ``_max_retries``, ``_retry_wait_ms``, and
+    ``_retry_backoff`` settings for exponential backoff.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        wait_ms = self._retry_wait_ms
+        for attempt in range(self._max_retries + 1):
+            try:
+                return method(self, *args, **kwargs)
+            except TransactionConflictError:
+                if attempt < self._max_retries:
+                    time.sleep(wait_ms / 1000.0)
+                    wait_ms *= self._retry_backoff
+                    self._reset_connection()
+                else:
+                    raise
+        # Unreachable, but keeps mypy happy.
+        raise RuntimeError("retry loop exited unexpectedly")  # pragma: no cover
+
+    return wrapper
+
+
 @dataclass
 class _ColumnDef:
     """Internal column definition for registration."""
@@ -313,6 +364,9 @@ class DuckLakeCatalogWriter:
         data_inlining_row_limit: int = 0,
         author: str | None = None,
         commit_message: str | None = None,
+        max_retries: int = 3,
+        retry_wait_ms: float = 100,
+        retry_backoff: float = 2.0,
     ) -> None:
         self._backend = create_backend(metadata_path)
         self._metadata_path = metadata_path
@@ -322,6 +376,15 @@ class DuckLakeCatalogWriter:
         self._commit_message = commit_message
         self._con: Any = None
         self._catalog_version: str | None = None
+
+        # Optimistic concurrency control settings
+        self._max_retries = max_retries
+        self._retry_wait_ms = retry_wait_ms
+        self._retry_backoff = retry_backoff
+
+        # Per-transaction conflict tracking state
+        self._txn_start_snapshot: int | None = None
+        self._txn_conflict_tables: dict[int, str] = {}
 
     @property
     def _is_v04(self) -> bool:
@@ -358,19 +421,245 @@ class DuckLakeCatalogWriter:
         self.close()
 
     # ------------------------------------------------------------------
+    # Optimistic concurrency control
+    # ------------------------------------------------------------------
+
+    def _reset_connection(self) -> None:
+        """Reset the connection, discarding any uncommitted state.
+
+        Called between retry attempts after a
+        :class:`TransactionConflictError`.
+        """
+        if self._con is not None:
+            try:
+                self._con.rollback()
+            except Exception:
+                pass
+            try:
+                self._con.close()
+            except Exception:
+                pass
+            self._con = None
+        self._txn_start_snapshot = None
+        self._txn_conflict_tables = {}
+
+    def _start_write_transaction(self, start_snapshot_id: int) -> None:
+        """Begin tracking a write transaction for conflict detection."""
+        self._txn_start_snapshot = start_snapshot_id
+        self._txn_conflict_tables = {}
+
+    def _track_table_write(self, table_id: int, operation: str) -> None:
+        """Track a table being modified for conflict detection.
+
+        Parameters
+        ----------
+        table_id
+            The table being written to.
+        operation
+            One of ``'insert'``, ``'delete'``, ``'update'``,
+            ``'overwrite'``, ``'ddl'``, ``'drop_table'``.
+        """
+        if table_id not in self._txn_conflict_tables:
+            self._txn_conflict_tables[table_id] = operation
+
+    def _snapshot_tables_exist(self) -> bool:
+        """Check if snapshot tracking tables exist in the catalog."""
+        return (
+            self._backend.table_exists(self._connect()._con, "ducklake_snapshot")
+            and self._backend.table_exists(self._connect()._con, "ducklake_snapshot_changes")
+        )
+
+    def _get_concurrent_changes(
+        self, start_snapshot_id: int,
+    ) -> list[tuple[int, str]]:
+        """Read snapshot changes committed after *start_snapshot_id*.
+
+        Uses a **separate** read-only connection so we see changes
+        committed by other writers, even if we have an open write
+        transaction on ``self._con``.
+
+        Returns an empty list if snapshot tables don't exist (v0.3 catalogs).
+        """
+        # DuckDB doesn't support multiple connections to the same file
+        from ducklake_core._backend import DuckDBBackend
+        if isinstance(self._backend, DuckDBBackend):
+            return []
+
+        raw = self._backend.connect()
+        try:
+            check_con = _PlaceholderConnection(raw, self._backend.placeholder)
+            # Check if tables exist
+            if not self._backend.table_exists(raw, "ducklake_snapshot_changes"):
+                return []
+            rows = check_con.execute(
+                "SELECT sc.snapshot_id, sc.changes_made "
+                "FROM ducklake_snapshot_changes sc "
+                "JOIN ducklake_snapshot s ON sc.snapshot_id = s.snapshot_id "
+                "WHERE sc.snapshot_id > ?",
+                [start_snapshot_id],
+            ).fetchall()
+            return [(r[0], r[1]) for r in rows]
+        finally:
+            try:
+                raw.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _parse_table_changes(
+        changes_made: str,
+    ) -> dict[int, set[str]]:
+        """Parse a ``changes_made`` string into ``{table_id: {change_types}}``.
+
+        Recognised prefixes:
+        ``inserted_into_table:``, ``deleted_from_table:``,
+        ``altered_table:``, ``dropped_table:``.
+        """
+        result: dict[int, set[str]] = {}
+        if not changes_made:
+            return result
+        for change in changes_made.split(","):
+            change = change.strip()
+            for prefix in (
+                "inserted_into_table:",
+                "deleted_from_table:",
+                "altered_table:",
+                "dropped_table:",
+            ):
+                if change.startswith(prefix):
+                    try:
+                        tid = int(change[len(prefix):])
+                        result.setdefault(tid, set()).add(prefix.rstrip(":"))
+                    except ValueError:
+                        pass
+        return result
+
+    def _check_conflicts(
+        self,
+        start_snapshot_id: int,
+        conflict_tables: dict[int, str],
+    ) -> None:
+        """Check for conflicts between our pending writes and concurrent commits.
+
+        Raises :class:`TransactionConflictError` if a conflict is found.
+        """
+        if not conflict_tables:
+            return
+
+        changes = self._get_concurrent_changes(start_snapshot_id)
+        if not changes:
+            return
+
+        # Aggregate all concurrent per-table changes.
+        concurrent: dict[int, set[str]] = {}
+        for _snap_id, changes_made in changes:
+            for tid, ops in self._parse_table_changes(changes_made).items():
+                concurrent.setdefault(tid, set()).update(ops)
+
+        for table_id, operation in conflict_tables.items():
+            if table_id not in concurrent:
+                continue
+
+            concurrent_ops = concurrent[table_id]
+
+            # Table was dropped → always conflicts.
+            if "dropped_table" in concurrent_ops:
+                raise TransactionConflictError(
+                    f"Conflict: table {table_id} was dropped by a concurrent "
+                    f"transaction"
+                )
+
+            if operation == "insert":
+                # Inserts conflict only with DDL, not with other inserts.
+                if "altered_table" in concurrent_ops:
+                    raise TransactionConflictError(
+                        f"Conflict: table {table_id} schema was altered "
+                        f"during concurrent insert"
+                    )
+
+            elif operation in ("delete", "update"):
+                # Deletes/updates conflict with DDL and other deletes.
+                if "altered_table" in concurrent_ops:
+                    raise TransactionConflictError(
+                        f"Conflict: table {table_id} schema was altered "
+                        f"during concurrent {operation}"
+                    )
+                if "deleted_from_table" in concurrent_ops:
+                    raise TransactionConflictError(
+                        f"Conflict: concurrent deletes on table {table_id} "
+                        f"during {operation}"
+                    )
+
+            elif operation == "overwrite":
+                # Overwrite conflicts with any concurrent DML/DDL.
+                conflicting = concurrent_ops & {
+                    "altered_table",
+                    "inserted_into_table",
+                    "deleted_from_table",
+                }
+                if conflicting:
+                    raise TransactionConflictError(
+                        f"Conflict: table {table_id} was modified "
+                        f"({', '.join(sorted(conflicting))}) during "
+                        f"concurrent overwrite"
+                    )
+
+            elif operation == "ddl":
+                # DDL conflicts with any concurrent change to the table.
+                conflicting = concurrent_ops & {
+                    "altered_table",
+                    "inserted_into_table",
+                    "deleted_from_table",
+                }
+                if conflicting:
+                    raise TransactionConflictError(
+                        f"Conflict: table {table_id} was modified "
+                        f"({', '.join(sorted(conflicting))}) during "
+                        f"concurrent DDL operation"
+                    )
+
+            elif operation == "drop_table":
+                # Drop conflicts with any concurrent change.
+                if concurrent_ops:
+                    raise TransactionConflictError(
+                        f"Conflict: table {table_id} was modified during "
+                        f"concurrent drop"
+                    )
+
+    def _commit_metadata(self) -> None:
+        """Check for conflicts (if tracked) and commit the transaction.
+
+        If ``_start_write_transaction`` was called, the conflict check
+        runs against all tables registered via ``_track_table_write``.
+        Otherwise this is a plain ``commit()``.
+        """
+        if self._txn_start_snapshot is not None and self._txn_conflict_tables:
+            self._check_conflicts(
+                self._txn_start_snapshot, self._txn_conflict_tables,
+            )
+        self._connect().commit()
+        self._txn_start_snapshot = None
+        self._txn_conflict_tables = {}
+
+    # ------------------------------------------------------------------
     # Snapshot management
     # ------------------------------------------------------------------
 
-    def _get_latest_snapshot(self) -> tuple[int, int, int, int]:
-        """Return (snapshot_id, schema_version, next_catalog_id, next_file_id)."""
+    def _get_latest_snapshot(self) -> tuple[int, int, int, int] | None:
+        """Return (snapshot_id, schema_version, next_catalog_id, next_file_id).
+
+        Returns None if snapshot tables don't exist (v0.3 catalogs without
+        snapshot tracking).
+        """
         con = self._connect()
+        if not self._backend.table_exists(con._con, "ducklake_snapshot"):
+            return None
         row = con.execute(
             "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id "
             "FROM ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1"
         ).fetchone()
         if row is None:
-            msg = "No snapshots found — is this a valid DuckLake catalog?"
-            raise ValueError(msg)
+            return None
         return (row[0], row[1], row[2], row[3])
 
     def _create_snapshot(
@@ -379,20 +668,32 @@ class DuckLakeCatalogWriter:
         next_catalog_id: int,
         next_file_id: int,
     ) -> int:
-        """Create a new snapshot and return its ID."""
+        """Create a new snapshot and return its ID.
+
+        Uses retry logic to handle concurrent snapshot creation (UNIQUE
+        constraint on snapshot_id).
+        """
         con = self._connect()
-        row = con.execute(
-            "SELECT COALESCE(MAX(snapshot_id), -1) + 1 FROM ducklake_snapshot"
-        ).fetchone()
-        new_id = row[0]
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f+00")
-        con.execute(
-            "INSERT INTO ducklake_snapshot "
-            "(snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [new_id, now, schema_version, next_catalog_id, next_file_id],
-        )
-        return new_id
+        for _attempt in range(10):
+            row = con.execute(
+                "SELECT COALESCE(MAX(snapshot_id), -1) + 1 FROM ducklake_snapshot"
+            ).fetchone()
+            new_id = row[0]
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f+00")
+            try:
+                con.execute(
+                    "INSERT INTO ducklake_snapshot "
+                    "(snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [new_id, now, schema_version, next_catalog_id, next_file_id],
+                )
+                return new_id
+            except Exception:
+                # Concurrent writer got the same ID — retry with next
+                import time
+                time.sleep(0.01 * (_attempt + 1))
+        msg = "Failed to create snapshot after 10 retries"
+        raise RuntimeError(msg)
 
     def _insert_schema_version(
         self, snapshot_id: int, schema_version: int, table_id: int | None = None
@@ -833,6 +1134,7 @@ class DuckLakeCatalogWriter:
 
         return defs
 
+    @_retryable
     def create_table(
         self,
         table_name: str,
@@ -846,7 +1148,12 @@ class DuckLakeCatalogWriter:
         Returns the new table_id.
         """
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         if self._table_exists(table_name, schema_name, snap_id) is not None:
             msg = f"Table '{schema_name}.{table_name}' already exists"
@@ -908,9 +1215,10 @@ class DuckLakeCatalogWriter:
             new_snap, f'created_table:"{safe_schema}"."{safe_table}"'
         )
 
-        con.commit()
+        self._commit_metadata()
         return table_id
 
+    @_retryable
     def create_table_with_data(
         self,
         table_name: str,
@@ -926,7 +1234,12 @@ class DuckLakeCatalogWriter:
         df = _decode_dictionary_columns(df)
 
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         if self._table_exists(table_name, schema_name, snap_id) is not None:
             msg = f"Table '{schema_name}.{table_name}' already exists"
@@ -1050,7 +1363,7 @@ class DuckLakeCatalogWriter:
             new_snap, f'created_table:"{safe_schema}"."{safe_table}"'
         )
 
-        con.commit()
+        self._commit_metadata()
         return new_snap
 
     # ------------------------------------------------------------------
@@ -1370,6 +1683,7 @@ class DuckLakeCatalogWriter:
                     [table_id, col_id, contains_null, contains_nan, min_val, max_val],
                 )
 
+    @_retryable
     def insert_data(
         self,
         df: pa.Table,
@@ -1389,11 +1703,17 @@ class DuckLakeCatalogWriter:
             raise ValueError(msg)
 
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id, table_path, table_path_rel, schema_path, schema_path_rel = (
             self._get_table_info(table_name, schema_name, snap_id)
         )
+        self._track_table_write(table_id, "insert")
 
         columns = self._get_columns_for_table(table_id, snap_id)
 
@@ -1459,7 +1779,7 @@ class DuckLakeCatalogWriter:
         self._update_table_column_stats(table_id, columns, col_stats)
 
         self._record_change(new_snap, f"inserted_into_table:{table_id}")
-        con.commit()
+        self._commit_metadata()
         return new_snap
 
     def _insert_inlined(
@@ -1492,7 +1812,7 @@ class DuckLakeCatalogWriter:
         )
 
         self._record_change(new_snap, f"inserted_into_table:{table_id}")
-        con.commit()
+        self._commit_metadata()
         return new_snap
 
     def _insert_partitioned(
@@ -1590,7 +1910,7 @@ class DuckLakeCatalogWriter:
         self._update_table_column_stats(table_id, columns, full_col_stats)
 
         self._record_change(new_snap, f"inserted_into_table:{table_id}")
-        con.commit()
+        self._commit_metadata()
         return new_snap
 
     # ------------------------------------------------------------------
@@ -1617,6 +1937,7 @@ class DuckLakeCatalogWriter:
             [new_snap, table_id, snapshot_id, snapshot_id],
         )
 
+    @_retryable
     def overwrite_data(
         self,
         df: pa.Table,
@@ -1630,11 +1951,17 @@ class DuckLakeCatalogWriter:
         Returns the new snapshot ID.
         """
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id, table_path, table_path_rel, schema_path, schema_path_rel = (
             self._get_table_info(table_name, schema_name, snap_id)
         )
+        self._track_table_write(table_id, "overwrite")
 
         columns = self._get_columns_for_table(table_id, snap_id)
 
@@ -1703,7 +2030,7 @@ class DuckLakeCatalogWriter:
                     [table_id, col_id, contains_null, nan_int, min_val, max_val],
                 )
             self._record_change(new_snap, f"inserted_into_table:{table_id}")
-            con.commit()
+            self._commit_metadata()
             return new_snap
 
         if record_count > 0:
@@ -1772,7 +2099,7 @@ class DuckLakeCatalogWriter:
             )
 
         self._record_change(new_snap, f"inserted_into_table:{table_id}")
-        con.commit()
+        self._commit_metadata()
         return new_snap
 
     def _overwrite_partitioned(
@@ -1884,7 +2211,7 @@ class DuckLakeCatalogWriter:
             )
 
         self._record_change(new_snap, f"inserted_into_table:{table_id}")
-        con.commit()
+        self._commit_metadata()
         return new_snap
 
     # ------------------------------------------------------------------
@@ -2051,6 +2378,7 @@ class DuckLakeCatalogWriter:
             ],
         )
 
+    @_retryable
     def delete_data(
         self,
         predicate: Callable[[pa.Table], pa.ChunkedArray],
@@ -2067,11 +2395,17 @@ class DuckLakeCatalogWriter:
         Returns the number of deleted rows.
         """
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id, table_path, table_path_rel, schema_path, schema_path_rel = (
             self._get_table_info(table_name, schema_name, snap_id)
         )
+        self._track_table_write(table_id, "delete")
 
         columns = self._get_columns_for_table(table_id, snap_id)
         data_files = self._get_active_data_files(table_id, snap_id)
@@ -2156,11 +2490,11 @@ class DuckLakeCatalogWriter:
             total_deleted += inlined_deleted
 
         if total_deleted == 0:
-            con.commit()
+            self._commit_metadata()
             return 0
 
         self._record_change(new_snap, f"deleted_from_table:{table_id}")
-        con.commit()
+        self._commit_metadata()
         return total_deleted
 
     # ------------------------------------------------------------------
@@ -2218,6 +2552,7 @@ class DuckLakeCatalogWriter:
             return None
         return pa.concat_tables(all_matched) if len(all_matched) > 1 else all_matched[0]
 
+    @_retryable
     def update_data(
         self,
         updates: dict[str, Any],
@@ -2237,11 +2572,17 @@ class DuckLakeCatalogWriter:
         Returns the number of rows updated.
         """
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id, table_path, table_path_rel, schema_path, schema_path_rel = (
             self._get_table_info(table_name, schema_name, snap_id)
         )
+        self._track_table_write(table_id, "update")
 
         columns = self._get_columns_for_table(table_id, snap_id)
         data_files = self._get_active_data_files(table_id, snap_id)
@@ -2434,7 +2775,7 @@ class DuckLakeCatalogWriter:
             f"inserted_into_table:{table_id},deleted_from_table:{table_id}",
         )
 
-        con.commit()
+        self._commit_metadata()
         return total_updated
 
     # ------------------------------------------------------------------
@@ -2517,6 +2858,7 @@ class DuckLakeCatalogWriter:
 
         return apply_multi
 
+    @_retryable
     def merge_data(
         self,
         source_df: pa.Table,
@@ -2550,11 +2892,17 @@ class DuckLakeCatalogWriter:
             on = [on]
 
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id, table_path, table_path_rel, schema_path, schema_path_rel = (
             self._get_table_info(table_name, schema_name, snap_id)
         )
+        self._track_table_write(table_id, "update")
 
         columns = self._get_columns_for_table(table_id, snap_id)
         col_names = [c[1] for c in columns]
@@ -2835,7 +3183,7 @@ class DuckLakeCatalogWriter:
             changes.append(f"inserted_into_table:{table_id}")
         self._record_change(new_snap, ",".join(changes))
 
-        con.commit()
+        self._commit_metadata()
         return (total_updated, total_inserted)
 
     # ------------------------------------------------------------------
@@ -2863,6 +3211,7 @@ class DuckLakeCatalogWriter:
         ).fetchone()
         return row[0]
 
+    @_retryable
     def add_column(
         self,
         table_name: str,
@@ -2874,12 +3223,18 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Add a new column to an existing table."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
             msg = f"Table '{schema_name}.{table_name}' not found"
             raise ValueError(msg)
+        self._track_table_write(table_id, "ddl")
 
         columns = self._get_columns_for_table(table_id, snap_id)
         for _, col_name, _, _ in columns:
@@ -2919,12 +3274,13 @@ class DuckLakeCatalogWriter:
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
-        con.commit()
+        self._commit_metadata()
 
     # ------------------------------------------------------------------
     # ALTER TABLE: RENAME COLUMN
     # ------------------------------------------------------------------
 
+    @_retryable
     def rename_column(
         self,
         table_name: str,
@@ -2935,12 +3291,18 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Rename a column in an existing table."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
             msg = f"Table '{schema_name}.{table_name}' not found"
             raise ValueError(msg)
+        self._track_table_write(table_id, "ddl")
 
         columns = self._get_columns_for_table(table_id, snap_id)
         target_col: tuple[int, str, str, int | None] | None = None
@@ -2999,12 +3361,13 @@ class DuckLakeCatalogWriter:
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
-        con.commit()
+        self._commit_metadata()
 
     # ------------------------------------------------------------------
     # ALTER TABLE: SET COLUMN TYPE
     # ------------------------------------------------------------------
 
+    @_retryable
     def set_column_type(
         self,
         table_name: str,
@@ -3030,12 +3393,18 @@ class DuckLakeCatalogWriter:
             Schema name (default: ``"main"``).
         """
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
             msg = f"Table '{schema_name}.{table_name}' not found"
             raise ValueError(msg)
+        self._track_table_write(table_id, "ddl")
 
         columns = self._get_columns_for_table(table_id, snap_id)
         target_col: tuple[int, str, str, int | None] | None = None
@@ -3099,7 +3468,7 @@ class DuckLakeCatalogWriter:
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
-        con.commit()
+        self._commit_metadata()
 
     # ------------------------------------------------------------------
     # DROP TABLE
@@ -3115,6 +3484,7 @@ class DuckLakeCatalogWriter:
             [new_snap, table_id, snapshot_id, snapshot_id],
         )
 
+    @_retryable
     def drop_table(
         self,
         table_name: str,
@@ -3123,12 +3493,18 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Drop a table from the catalog."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
             msg = f"Table '{schema_name}.{table_name}' not found"
             raise ValueError(msg)
+        self._track_table_write(table_id, "drop_table")
 
         new_schema_ver = schema_ver + 1
 
@@ -3149,7 +3525,7 @@ class DuckLakeCatalogWriter:
 
         self._record_change(new_snap, f"dropped_table:{table_id}")
 
-        con.commit()
+        self._commit_metadata()
 
     # ------------------------------------------------------------------
     # CREATE SCHEMA
@@ -3168,13 +3544,19 @@ class DuckLakeCatalogWriter:
         ).fetchone()
         return row[0] if row is not None else None
 
+    @_retryable
     def create_schema(
         self,
         schema_name: str,
     ) -> int:
         """Create a new schema in the catalog. Returns the new schema_id."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         if self._schema_exists(schema_name, snap_id) is not None:
             msg = f"Schema '{schema_name}' already exists"
@@ -3201,7 +3583,7 @@ class DuckLakeCatalogWriter:
         safe_schema = schema_name.replace('"', '""')
         self._record_change(new_snap, f'created_schema:"{safe_schema}"')
 
-        con.commit()
+        self._commit_metadata()
         return schema_id
 
     # ------------------------------------------------------------------
@@ -3221,6 +3603,7 @@ class DuckLakeCatalogWriter:
         ).fetchall()
         return [(r[0], r[1]) for r in rows]
 
+    @_retryable
     def drop_schema(
         self,
         schema_name: str,
@@ -3229,7 +3612,12 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Drop a schema from the catalog."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         schema_id = self._schema_exists(schema_name, snap_id)
         if schema_id is None:
@@ -3278,12 +3666,13 @@ class DuckLakeCatalogWriter:
         ordered = schema_changes + table_changes
         self._record_change(new_snap, ",".join(ordered))
 
-        con.commit()
+        self._commit_metadata()
 
     # ------------------------------------------------------------------
     # RENAME TABLE
     # ------------------------------------------------------------------
 
+    @_retryable
     def rename_table(
         self,
         old_table_name: str,
@@ -3293,12 +3682,18 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Rename a table in the catalog."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id = self._table_exists(old_table_name, schema_name, snap_id)
         if table_id is None:
             msg = f"Table '{schema_name}.{old_table_name}' not found"
             raise ValueError(msg)
+        self._track_table_write(table_id, "ddl")
 
         if self._table_exists(new_table_name, schema_name, snap_id) is not None:
             msg = f"Table '{schema_name}.{new_table_name}' already exists"
@@ -3342,7 +3737,7 @@ class DuckLakeCatalogWriter:
             new_snap, f'created_table:"{safe_schema}"."{safe_table}"'
         )
 
-        con.commit()
+        self._commit_metadata()
 
     # ------------------------------------------------------------------
     # ALTER TABLE: DROP COLUMN
@@ -3366,6 +3761,7 @@ class DuckLakeCatalogWriter:
             )
             self._end_descendant_columns(table_id, child_id, new_snap)
 
+    @_retryable
     def drop_column(
         self,
         table_name: str,
@@ -3375,12 +3771,18 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Drop a column from an existing table."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
             msg = f"Table '{schema_name}.{table_name}' not found"
             raise ValueError(msg)
+        self._track_table_write(table_id, "ddl")
 
         columns = self._get_columns_for_table(table_id, snap_id)
         target_col_id = None
@@ -3409,7 +3811,7 @@ class DuckLakeCatalogWriter:
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
-        con.commit()
+        self._commit_metadata()
 
     # ------------------------------------------------------------------
     # ALTER TABLE: SET PARTITIONED BY
@@ -3448,6 +3850,7 @@ class DuckLakeCatalogWriter:
             return []
         return [(r[0], r[1], r[2]) for r in rows]
 
+    @_retryable
     def set_partitioned_by(
         self,
         table_name: str,
@@ -3457,12 +3860,18 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Set identity-transform partitioning on an existing table."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
             msg = f"Table '{schema_name}.{table_name}' not found"
             raise ValueError(msg)
+        self._track_table_write(table_id, "ddl")
 
         columns = self._get_columns_for_table(table_id, snap_id)
         col_name_to_id: dict[str, int] = {c[1]: c[0] for c in columns}
@@ -3498,7 +3907,7 @@ class DuckLakeCatalogWriter:
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
-        con.commit()
+        self._commit_metadata()
 
     # ------------------------------------------------------------------
     # ALTER TABLE: SET SORT KEYS
@@ -3613,6 +4022,7 @@ class DuckLakeCatalogWriter:
             return self._sort_table_by_keys(df, sort_keys)
         return df
 
+    @_retryable
     def set_sort_keys(
         self,
         table_name: str,
@@ -3635,12 +4045,18 @@ class DuckLakeCatalogWriter:
         con = self._connect()
         self._ensure_sort_tables()
 
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
             msg = f"Table '{schema_name}.{table_name}' not found"
             raise ValueError(msg)
+        self._track_table_write(table_id, "ddl")
 
         columns = self._get_columns_for_table(table_id, snap_id)
         col_names_set = {c[1] for c in columns}
@@ -3703,8 +4119,9 @@ class DuckLakeCatalogWriter:
 
         self._record_change(new_snap, f"altered_table:{table_id}")
 
-        con.commit()
+        self._commit_metadata()
 
+    @_retryable
     def reset_sort_keys(
         self,
         table_name: str,
@@ -3718,12 +4135,18 @@ class DuckLakeCatalogWriter:
         con = self._connect()
         self._ensure_sort_tables()
 
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
             msg = f"Table '{schema_name}.{table_name}' not found"
             raise ValueError(msg)
+        self._track_table_write(table_id, "ddl")
 
         # Check if there are active sort keys
         existing = self._get_active_sort_keys(table_id, snap_id)
@@ -3742,7 +4165,7 @@ class DuckLakeCatalogWriter:
         self._insert_schema_version(new_snap, new_schema_ver, table_id)
 
         self._record_change(new_snap, f"altered_table:{table_id}")
-        con.commit()
+        self._commit_metadata()
 
     # ------------------------------------------------------------------
     # EXPIRE SNAPSHOTS
@@ -3857,7 +4280,11 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Set a tag on a table. Overwrites existing tag with same key."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
@@ -3886,7 +4313,7 @@ class DuckLakeCatalogWriter:
         self._record_change(
             new_snap, f'set_table_tag:"{safe_schema}"."{safe_table}"."{key}"'
         )
-        con.commit()
+        self._commit_metadata()
 
     def delete_table_tag(
         self,
@@ -3897,7 +4324,11 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Remove a tag from a table."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
@@ -3927,7 +4358,7 @@ class DuckLakeCatalogWriter:
         self._record_change(
             new_snap, f'delete_table_tag:"{safe_schema}"."{safe_table}"."{key}"'
         )
-        con.commit()
+        self._commit_metadata()
 
     def set_column_tag(
         self,
@@ -3940,7 +4371,11 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Set a tag on a column. Overwrites existing tag with same key."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
@@ -3981,7 +4416,7 @@ class DuckLakeCatalogWriter:
             new_snap,
             f'set_column_tag:"{safe_schema}"."{safe_table}"."{safe_col}"."{key}"',
         )
-        con.commit()
+        self._commit_metadata()
 
     def delete_column_tag(
         self,
@@ -3993,7 +4428,11 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Remove a tag from a column."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
 
         table_id = self._table_exists(table_name, schema_name, snap_id)
         if table_id is None:
@@ -4035,7 +4474,7 @@ class DuckLakeCatalogWriter:
             new_snap,
             f'delete_column_tag:"{safe_schema}"."{safe_table}"."{safe_col}"."{key}"',
         )
-        con.commit()
+        self._commit_metadata()
 
     def vacuum(self) -> int:
         """Delete orphaned Parquet files not referenced by any catalog entry."""
@@ -4110,6 +4549,7 @@ class DuckLakeCatalogWriter:
             raise
         return row[0] if row is not None else None
 
+    @_retryable
     def create_view(
         self,
         view_name: str,
@@ -4121,7 +4561,12 @@ class DuckLakeCatalogWriter:
     ) -> int:
         """Create a view in the catalog. Returns the new view_id."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         existing_view_id = self._view_exists(view_name, schema_name, snap_id)
 
@@ -4167,13 +4612,14 @@ class DuckLakeCatalogWriter:
 
         self._record_change(new_snap, ",".join(changes))
 
-        con.commit()
+        self._commit_metadata()
         return view_id
 
     # ------------------------------------------------------------------
     # DROP VIEW
     # ------------------------------------------------------------------
 
+    @_retryable
     def drop_view(
         self,
         view_name: str,
@@ -4182,7 +4628,12 @@ class DuckLakeCatalogWriter:
     ) -> None:
         """Drop a view from the catalog."""
         con = self._connect()
-        snap_id, schema_ver, next_cat_id, next_file_id = self._get_latest_snapshot()
+        snapshot_info = self._get_latest_snapshot()
+        if snapshot_info is None:
+            snap_id, schema_ver, next_cat_id, next_file_id = -1, 0, 1, 1
+        else:
+            snap_id, schema_ver, next_cat_id, next_file_id = snapshot_info
+        self._start_write_transaction(snap_id)
 
         view_id = self._view_exists(view_name, schema_name, snap_id)
         if view_id is None:
@@ -4203,7 +4654,7 @@ class DuckLakeCatalogWriter:
 
         self._record_change(new_snap, f"dropped_view:{view_id}")
 
-        con.commit()
+        self._commit_metadata()
 
     @staticmethod
     def _resolve_vacuum_path(
