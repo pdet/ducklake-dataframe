@@ -1,197 +1,73 @@
-"""Tests for DuckLake macro support (list_macros, get_macro)."""
+"""Tests for DuckLake catalog inspection utilities."""
 
 from __future__ import annotations
 
-import polars as pl
-import pandas as pd
 import pytest
-
-from ducklake_polars import DuckLakeCatalog as PolarsCatalog
-from ducklake_polars import list_macros as polars_list_macros
-from ducklake_polars import get_macro as polars_get_macro
-
-from ducklake_pandas import DuckLakeCatalog as PandasCatalog
-from ducklake_pandas import list_macros as pandas_list_macros
-from ducklake_pandas import get_macro as pandas_get_macro
+import ducklake_polars
+import ducklake_pandas
 
 
-class TestListMacrosEmpty:
-    """Test list_macros on a catalog with no macros."""
+@pytest.fixture(params=["sqlite"])
+def catalog(request, tmp_path):
+    """Create a DuckLake catalog with some tables."""
+    import duckdb
 
-    def test_empty_catalog_polars(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.close()
-
-        result = polars_list_macros(cat.metadata_path)
-        assert isinstance(result, pl.DataFrame)
-        assert result.columns == ["macro_id", "macro_name", "macro_type"]
-        assert len(result) == 0
-
-    def test_empty_catalog_pandas(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.close()
-
-        result = pandas_list_macros(cat.metadata_path)
-        assert isinstance(result, pd.DataFrame)
-        assert list(result.columns) == ["macro_id", "macro_name", "macro_type"]
-        assert len(result) == 0
+    db_path = str(tmp_path / "test.ducklake")
+    conn = duckdb.connect()
+    conn.execute(f"ATTACH '{db_path}' AS test (TYPE DUCKLAKE)")
+    conn.execute("CREATE TABLE test.main.users (id INTEGER, name VARCHAR)")
+    conn.execute("INSERT INTO test.main.users VALUES (1, 'Alice'), (2, 'Bob')")
+    conn.execute("CREATE TABLE test.main.orders (id INTEGER, user_id INTEGER, amount DOUBLE)")
+    conn.execute("INSERT INTO test.main.orders VALUES (1, 1, 99.99)")
+    conn.close()
+    return db_path
 
 
-class TestListMacrosWithMacros:
-    """Test list_macros when macros exist."""
+class TestListTables:
+    def test_list_tables_polars(self, catalog):
+        tables = ducklake_polars.list_tables(catalog)
+        assert set(tables) == {"users", "orders"}
 
-    def test_scalar_macro_polars(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute(
-            "CREATE MACRO ducklake.double_it(x) AS x * 2"
-        )
-        cat.close()
+    def test_list_tables_pandas(self, catalog):
+        tables = ducklake_pandas.list_tables(catalog)
+        assert set(tables) == {"users", "orders"}
 
-        result = polars_list_macros(cat.metadata_path)
-        assert isinstance(result, pl.DataFrame)
-        assert len(result) == 1
-        assert result["macro_name"][0] == "double_it"
-        assert result["macro_type"][0] == "scalar"
+    def test_list_tables_empty_catalog(self, tmp_path):
+        import duckdb
 
-    def test_scalar_macro_pandas(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute(
-            "CREATE MACRO ducklake.double_it(x) AS x * 2"
-        )
-        cat.close()
-
-        result = pandas_list_macros(cat.metadata_path)
-        assert isinstance(result, pd.DataFrame)
-        assert len(result) == 1
-        assert result["macro_name"].iloc[0] == "double_it"
-        assert result["macro_type"].iloc[0] == "scalar"
-
-    def test_multiple_macros(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute("CREATE MACRO ducklake.add_one(x) AS x + 1")
-        cat.execute("CREATE MACRO ducklake.add_two(x) AS x + 2")
-        cat.close()
-
-        result = polars_list_macros(cat.metadata_path)
-        assert len(result) == 2
-        names = sorted(result["macro_name"].to_list())
-        assert names == ["add_one", "add_two"]
-
-    def test_catalog_api_class(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute("CREATE MACRO ducklake.triple(x) AS x * 3")
-        cat.close()
-
-        api = PolarsCatalog(cat.metadata_path)
-        result = api.list_macros()
-        assert len(result) == 1
-        assert result["macro_name"][0] == "triple"
-
-    def test_table_macro(self, ducklake_catalog):
-        """Test listing table macros."""
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute(
-            "CREATE MACRO ducklake.my_range(n) AS TABLE "
-            "SELECT * FROM range(n)"
-        )
-        cat.close()
-
-        result = polars_list_macros(cat.metadata_path)
-        assert len(result) == 1
-        assert result["macro_name"][0] == "my_range"
-        assert result["macro_type"][0] == "table"
+        db_path = str(tmp_path / "empty.ducklake")
+        conn = duckdb.connect()
+        conn.execute(f"ATTACH '{db_path}' AS test (TYPE DUCKLAKE)")
+        conn.close()
+        tables = ducklake_polars.list_tables(db_path)
+        assert tables == []
 
 
-class TestGetMacro:
-    """Test get_macro retrieves macro definition details."""
+class TestListSnapshots:
+    def test_list_snapshots(self, catalog):
+        snapshots = ducklake_polars.list_snapshots(catalog)
+        assert len(snapshots) > 0
+        # Each snapshot has id and time
+        assert "snapshot_id" in snapshots[0]
+        assert "snapshot_time" in snapshots[0]
 
-    def test_get_scalar_macro(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute("CREATE MACRO ducklake.double_it(x) AS x * 2")
-        cat.close()
+    def test_list_snapshots_limit(self, catalog):
+        snapshots = ducklake_polars.list_snapshots(catalog, limit=2)
+        assert len(snapshots) <= 2
 
-        result = polars_get_macro(cat.metadata_path, "double_it")
-        assert isinstance(result, pl.DataFrame)
-        assert len(result) >= 1
-        assert result["macro_name"][0] == "double_it"
-        assert result["macro_type"][0] == "scalar"
-        # SQL should contain the macro body
-        assert "2" in result["sql"][0]
-
-    def test_get_macro_pandas(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute("CREATE MACRO ducklake.inc(x) AS x + 1")
-        cat.close()
-
-        result = pandas_get_macro(cat.metadata_path, "inc")
-        assert isinstance(result, pd.DataFrame)
-        assert len(result) >= 1
-        assert result["macro_name"].iloc[0] == "inc"
-
-    def test_get_macro_not_found(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.close()
-
-        with pytest.raises(ValueError, match="not found"):
-            polars_get_macro(cat.metadata_path, "nonexistent")
-
-    def test_get_macro_with_parameters(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute(
-            "CREATE MACRO ducklake.add_vals(x, y) AS x + y"
-        )
-        cat.close()
-
-        result = polars_get_macro(cat.metadata_path, "add_vals")
-        assert len(result) >= 1
-        params = result["parameters"][0]
-        # Should contain both parameter names
-        assert "x" in params
-        assert "y" in params
-
-    def test_get_macro_catalog_api(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute("CREATE MACRO ducklake.negate(x) AS -x")
-        cat.close()
-
-        api = PolarsCatalog(cat.metadata_path)
-        result = api.get_macro("negate")
-        assert len(result) >= 1
-        assert result["macro_name"][0] == "negate"
-
-    def test_get_macro_case_insensitive(self, ducklake_catalog):
-        """Macro lookup should be case-insensitive."""
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute("CREATE MACRO ducklake.MyMacro(x) AS x + 10")
-        cat.close()
-
-        # DuckDB lowercases the macro name, so look up with lowercase
-        result = polars_get_macro(cat.metadata_path, "mymacro")
-        assert len(result) >= 1
+    def test_list_snapshots_pandas(self, catalog):
+        snapshots = ducklake_pandas.list_snapshots(catalog)
+        assert len(snapshots) > 0
 
 
-class TestMacroDropped:
-    """Test that dropped macros don't appear in list_macros."""
+class TestCatalogInfo:
+    def test_catalog_info(self, catalog):
+        info = ducklake_polars.catalog_info(catalog)
+        assert info["version"] in ("0.3", "0.4")
+        assert info["table_count"] == 2
+        assert info["snapshot_count"] > 0
+        assert "data_path" in info
 
-    def test_dropped_macro_not_listed(self, ducklake_catalog):
-        cat = ducklake_catalog
-        cat.execute("CREATE TABLE ducklake.t1 (a INTEGER)")
-        cat.execute("CREATE MACRO ducklake.temp_macro(x) AS x")
-        cat.execute("DROP MACRO ducklake.temp_macro")
-        cat.close()
-
-        result = polars_list_macros(cat.metadata_path)
-        assert len(result) == 0
+    def test_catalog_info_pandas(self, catalog):
+        info = ducklake_pandas.catalog_info(catalog)
+        assert info["table_count"] == 2

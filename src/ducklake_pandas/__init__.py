@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
 from ducklake_pandas._catalog_api import DuckLakeCatalog
+from ducklake_core._catalog import DuckLakeCatalogReader
 from ducklake_core._writer import TransactionConflictError
 
 __all__ = [
@@ -50,8 +51,9 @@ __all__ = [
     "set_ducklake_column_tag",
     "delete_ducklake_table_tag",
     "delete_ducklake_column_tag",
-    "list_macros",
-    "get_macro",
+    "list_tables",
+    "list_snapshots",
+    "catalog_info",
     "DuckLakeCatalog",
 ]
 
@@ -1742,72 +1744,36 @@ def delete_ducklake_column_tag(
         writer.delete_column_tag(table, column, key, schema_name=schema)
 
 
-def list_macros(
+def list_tables(
     path: str | Path,
     *,
     schema: str = "main",
     data_path: str | Path | None = None,
-) -> pd.DataFrame:
-    """
-    List all macros in a DuckLake catalog schema.
-
-    Parameters
-    ----------
-    path
-        Path to the DuckLake metadata catalog file (.ducklake or .db),
-        or a PostgreSQL connection string.
-    schema
-        Schema name (default: "main").
-    data_path
-        Override the data path stored in the catalog.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns: ``macro_id``, ``macro_name``, ``macro_type``.
-    """
+) -> list[str]:
+    """List all table names in a DuckLake catalog schema."""
     dp = os.fspath(data_path) if data_path is not None else None
-    with DuckLakeCatalog(os.fspath(path), data_path=dp) as cat:
-        return cat.list_macros(schema=schema)
+    with DuckLakeCatalogReader(os.fspath(path), data_path_override=dp) as reader:
+        return reader.list_tables(schema)
 
 
-def get_macro(
+def list_snapshots(
     path: str | Path,
-    name: str,
     *,
-    schema: str = "main",
-    dialect: str | None = None,
+    limit: int = 20,
     data_path: str | Path | None = None,
-) -> pd.DataFrame:
-    """
-    Get macro definition(s) by name from a DuckLake catalog.
-
-    Parameters
-    ----------
-    path
-        Path to the DuckLake metadata catalog file (.ducklake or .db),
-        or a PostgreSQL connection string.
-    name
-        Macro name.
-    schema
-        Schema name (default: "main").
-    dialect
-        If provided, return only the implementation for this dialect
-        (e.g., ``"duckdb"``). If None, return all implementations.
-    data_path
-        Override the data path stored in the catalog.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns: ``macro_name``, ``macro_type``, ``dialect``,
-        ``sql``, ``parameters``.
-
-    Raises
-    ------
-    ValueError
-        If the macro or schema is not found.
-    """
+) -> list[dict]:
+    """List recent snapshots from a DuckLake catalog."""
     dp = os.fspath(data_path) if data_path is not None else None
-    with DuckLakeCatalog(os.fspath(path), data_path=dp) as cat:
-        return cat.get_macro(name, schema=schema, dialect=dialect)
+    with DuckLakeCatalogReader(os.fspath(path), data_path_override=dp) as reader:
+        return reader.list_snapshots(limit=limit)
+
+
+def catalog_info(
+    path: str | Path,
+    *,
+    data_path: str | Path | None = None,
+) -> dict:
+    """Get catalog summary: version, data_path, table_count, snapshot_count."""
+    dp = os.fspath(data_path) if data_path is not None else None
+    with DuckLakeCatalogReader(os.fspath(path), data_path_override=dp) as reader:
+        return reader.catalog_info()

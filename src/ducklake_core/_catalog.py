@@ -309,6 +309,73 @@ class DuckLakeCatalogReader:
             next_file_id=row[2],
         )
 
+    def list_tables(self, schema_name: str = "main") -> list[str]:
+        """List all table names in a schema at the current snapshot."""
+        con = self._connect()
+        snapshot = self.get_current_snapshot()
+        rows = con.execute(
+            self._sql("""
+            SELECT t.table_name
+            FROM ducklake_table t
+            JOIN ducklake_schema s ON t.schema_id = s.schema_id
+            WHERE LOWER(s.schema_name) = LOWER(?)
+              AND ? >= t.begin_snapshot
+              AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
+              AND ? >= s.begin_snapshot
+              AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
+            ORDER BY t.table_name
+            """),
+            [schema_name, snapshot.snapshot_id, snapshot.snapshot_id,
+             snapshot.snapshot_id, snapshot.snapshot_id],
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def list_snapshots(self, limit: int = 20) -> list[dict]:
+        """List recent snapshots ordered by id descending."""
+        con = self._connect()
+        rows = con.execute(
+            self._sql("""
+            SELECT snapshot_id, snapshot_time, schema_version
+            FROM ducklake_snapshot
+            ORDER BY snapshot_id DESC
+            LIMIT ?
+            """),
+            [limit],
+        ).fetchall()
+        return [
+            {"snapshot_id": r[0], "snapshot_time": r[1], "schema_version": r[2]}
+            for r in rows
+        ]
+
+    def catalog_info(self) -> dict:
+        """Get catalog summary information."""
+        con = self._connect()
+        version = self._catalog_version
+        data_path = self.data_path
+
+        snapshot_count = con.execute(
+            "SELECT COUNT(*) FROM ducklake_snapshot"
+        ).fetchone()[0]
+
+        snapshot = self.get_current_snapshot()
+        table_count = con.execute(
+            self._sql("""
+            SELECT COUNT(*)
+            FROM ducklake_table t
+            WHERE ? >= t.begin_snapshot
+              AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
+            """),
+            [snapshot.snapshot_id, snapshot.snapshot_id],
+        ).fetchone()[0]
+
+        return {
+            "version": version,
+            "data_path": data_path,
+            "snapshot_count": snapshot_count,
+            "table_count": table_count,
+            "current_snapshot_id": snapshot.snapshot_id,
+        }
+
     def get_snapshot_at_version(self, version: int) -> SnapshotInfo:
         """Get snapshot info at a specific version."""
         con = self._connect()
