@@ -602,8 +602,10 @@ class DuckLakeDataset:
             self._cached_all_columns = None
             return snapshot, table, all_columns  # type: ignore[return-value]
         snapshot = self._resolve_snapshot(reader)
-        table = reader.get_table(self.table_name, self.schema_name, snapshot.snapshot_id)
-        all_columns = reader.get_all_columns(table.table_id, snapshot.snapshot_id)
+        # Combined query: table + columns in one roundtrip
+        table, all_columns = reader.get_table_with_columns(
+            self.table_name, self.schema_name, snapshot.snapshot_id
+        )
         return snapshot, table, all_columns
 
     #
@@ -689,8 +691,10 @@ class DuckLakeDataset:
         """
         reader = self._get_reader()
         snapshot = self._resolve_snapshot(reader)
-        table = reader.get_table(self.table_name, self.schema_name, snapshot.snapshot_id)
-        all_columns = reader.get_all_columns(table.table_id, snapshot.snapshot_id)
+        # Combined query: table + columns in one roundtrip
+        table, all_columns = reader.get_table_with_columns(
+            self.table_name, self.schema_name, snapshot.snapshot_id
+        )
         # Cache for reuse in to_dataset_scan()
         self._cached_snapshot = snapshot
         self._cached_table = table
@@ -873,12 +877,14 @@ class DuckLakeDataset:
             _has_col_changes = reader.has_column_changes(table.table_id)
             name_mappings: dict[int, dict[int, str]] = {}
             if _has_col_changes:
-                # Load field_id-based name mappings (only needed for rename detection)
-                mapping_ids_seen: set[int] = set()
+                # Batch-load all field_id-based name mappings in one query
+                # instead of N separate queries (one per mapping_id).
+                mapping_ids_needed: set[int] = set()
                 for f in data_files:
-                    if f.mapping_id is not None and f.mapping_id not in mapping_ids_seen:
-                        mapping_ids_seen.add(f.mapping_id)
-                        name_mappings[f.mapping_id] = reader.get_name_mapping(f.mapping_id)
+                    if f.mapping_id is not None:
+                        mapping_ids_needed.add(f.mapping_id)
+                if mapping_ids_needed:
+                    name_mappings = reader.get_name_mappings_batch(mapping_ids_needed)
 
                 history = reader.get_column_history(table.table_id)
                 has_rename = _has_renames(history, all_columns)
@@ -1042,10 +1048,17 @@ class DuckLakeDataset:
             # resolver only accepts bare Parquet SCAN nodes, so we must
             # collect the Parquet scan, append inlined rows, and write
             # everything to a single temp file).
-            inlined = reader.read_inlined_data(
-                table.table_id,
-                snapshot.snapshot_id,
-                column_names,
+            # Fast check: skip the expensive read_inlined_data query when
+            # the table has no inlined data tables at all.
+            _has_inlined = reader.has_inlined_data(table.table_id)
+            inlined = (
+                reader.read_inlined_data(
+                    table.table_id,
+                    snapshot.snapshot_id,
+                    column_names,
+                )
+                if _has_inlined
+                else None
             )
             if inlined is not None and not inlined.is_empty():
                 schema_dict = self._build_schema_from_columns(all_columns)

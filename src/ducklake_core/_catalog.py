@@ -167,6 +167,8 @@ class DuckLakeCatalogReader:
         self._con: Any = None
         self._data_path: str | None = None
         self._catalog_version: str | None = None
+        # Per-reader metadata cache (lifetime-scoped, cleared on close)
+        self._cache: dict[tuple, Any] = {}
 
     def _connect(self) -> Any:
         if self._con is None:
@@ -217,6 +219,7 @@ class DuckLakeCatalogReader:
             self._con.close()
             self._con = None
             self._data_path = None
+            self._cache.clear()
 
     @property
     def data_path(self) -> str:
@@ -347,6 +350,81 @@ class DuckLakeCatalogReader:
             schema_path_is_relative=bool(row[6]) if row[6] is not None else True,
         )
 
+    def get_table_with_columns(
+        self, table_name: str, schema_name: str, snapshot_id: int
+    ) -> tuple[TableInfo, list[ColumnInfo]]:
+        """Fetch table info and all columns in a single combined query.
+
+        Returns ``(table_info, all_columns)`` where ``all_columns`` includes
+        nested (child) columns.  This replaces the sequential
+        ``get_table()`` + ``get_all_columns()`` pattern and saves one
+        catalog round-trip.
+        """
+        con = self._connect()
+        rows = con.execute(
+            self._sql("""
+            SELECT t.table_id, t.table_name, t.schema_id,
+                   t.path, t.path_is_relative,
+                   s.path, s.path_is_relative,
+                   c.column_id, c.column_name, c.column_type, c.column_order,
+                   c.parent_column, c.nulls_allowed
+            FROM ducklake_table t
+            JOIN ducklake_schema s ON t.schema_id = s.schema_id
+            LEFT JOIN ducklake_column c
+              ON c.table_id = t.table_id
+              AND ? >= c.begin_snapshot
+              AND (? < c.end_snapshot OR c.end_snapshot IS NULL)
+            WHERE t.table_name = ?
+              AND s.schema_name = ?
+              AND ? >= t.begin_snapshot
+              AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
+              AND ? >= s.begin_snapshot
+              AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
+            ORDER BY c.column_order
+            """),
+            [
+                snapshot_id, snapshot_id,  # column snapshot filter
+                table_name, schema_name,   # table/schema name filter
+                snapshot_id, snapshot_id,  # table snapshot filter
+                snapshot_id, snapshot_id,  # schema snapshot filter
+            ],
+        ).fetchall()
+        if not rows:
+            msg = f"Table '{schema_name}.{table_name}' not found at snapshot {snapshot_id}"
+            raise ValueError(msg)
+
+        # Extract table info from the first row
+        r0 = rows[0]
+        table = TableInfo(
+            table_id=r0[0],
+            table_name=r0[1],
+            schema_id=r0[2],
+            table_path=r0[3] or "",
+            table_path_is_relative=bool(r0[4]) if r0[4] is not None else True,
+            schema_path=r0[5] or "",
+            schema_path_is_relative=bool(r0[6]) if r0[6] is not None else True,
+        )
+
+        # Extract columns (may be empty if table has no columns yet)
+        columns: list[ColumnInfo] = []
+        for r in rows:
+            if r[7] is not None:  # column_id is not NULL
+                columns.append(
+                    ColumnInfo(
+                        column_id=r[7],
+                        column_name=r[8],
+                        column_type=r[9],
+                        column_order=r[10],
+                        parent_column=r[11],
+                        nulls_allowed=bool(r[12]) if r[12] is not None else True,
+                    )
+                )
+
+        # Cache for potential reuse within the same reader session
+        self._cache[("table", table_name, schema_name, snapshot_id)] = table
+        self._cache[("columns", table.table_id, snapshot_id)] = columns
+        return table, columns
+
     def get_columns(self, table_id: int, snapshot_id: int) -> list[ColumnInfo]:
         """Get top-level column definitions for a table at a specific snapshot."""
         all_cols = self.get_all_columns(table_id, snapshot_id)
@@ -354,6 +432,9 @@ class DuckLakeCatalogReader:
 
     def get_all_columns(self, table_id: int, snapshot_id: int) -> list[ColumnInfo]:
         """Get all column definitions (including nested) for a table at a specific snapshot."""
+        cache_key = ("columns", table_id, snapshot_id)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
         con = self._connect()
         rows = con.execute(
             self._sql("""
@@ -367,7 +448,7 @@ class DuckLakeCatalogReader:
             """),
             [table_id, snapshot_id, snapshot_id],
         ).fetchall()
-        return [
+        result = [
             ColumnInfo(
                 column_id=r[0],
                 column_name=r[1],
@@ -378,6 +459,8 @@ class DuckLakeCatalogReader:
             )
             for r in rows
         ]
+        self._cache[cache_key] = result
+        return result
 
     def get_data_files(self, table_id: int, snapshot_id: int) -> list[FileInfo]:
         """Get data files for a table at a specific snapshot."""
@@ -710,6 +793,29 @@ class DuckLakeCatalogReader:
         ).fetchall()
         return {int(r[1]): r[0] for r in rows}
 
+    def get_name_mappings_batch(self, mapping_ids: set[int]) -> dict[int, dict[int, str]]:
+        """Fetch multiple name mappings in a single query.
+
+        Returns ``{mapping_id: {target_field_id: source_name}}`` for all
+        requested mapping IDs.  This replaces the N+1 pattern of calling
+        ``get_name_mapping()`` once per mapping ID.
+        """
+        if not mapping_ids:
+            return {}
+        con = self._connect()
+        ph = self._backend.placeholder
+        placeholders = ",".join([ph] * len(mapping_ids))
+        rows = con.execute(
+            f"SELECT mapping_id, source_name, target_field_id "
+            f"FROM ducklake_name_mapping "
+            f"WHERE mapping_id IN ({placeholders})",
+            list(mapping_ids),
+        ).fetchall()
+        result: dict[int, dict[int, str]] = {}
+        for r in rows:
+            result.setdefault(r[0], {})[int(r[2])] = r[1]
+        return result
+
     def get_all_snapshots(self) -> list[tuple]:
         """Get all snapshots ordered by snapshot_id."""
         con = self._connect()
@@ -854,6 +960,33 @@ class DuckLakeCatalogReader:
             mapping_id=row[7],
             begin_snapshot=row[8],
         )
+
+    def has_inlined_data(self, table_id: int) -> bool:
+        """Fast check: does this table have any inlined data tables?
+
+        Cheaper than ``get_inlined_data_tables()`` when you only need to
+        know whether inlined data exists.
+        """
+        cache_key = ("has_inlined", table_id)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        con = self._connect()
+        try:
+            row = con.execute(
+                self._sql(
+                    "SELECT EXISTS(SELECT 1 FROM ducklake_inlined_data_tables "
+                    "WHERE table_id = ?)"
+                ),
+                [table_id],
+            ).fetchone()
+            result = bool(row and row[0])
+        except Exception as e:
+            if self._backend.is_table_not_found(e):
+                result = False
+            else:
+                raise
+        self._cache[cache_key] = result
+        return result
 
     def get_inlined_data_tables(self, table_id: int) -> list[InlinedDataTableInfo]:
         """Get inlined data table info for a table."""
