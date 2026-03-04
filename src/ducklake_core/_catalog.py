@@ -309,6 +309,22 @@ class DuckLakeCatalogReader:
             next_file_id=row[2],
         )
 
+    def list_schemas(self) -> list[str]:
+        """List all schema names at the current snapshot."""
+        con = self._connect()
+        snapshot = self.get_current_snapshot()
+        rows = con.execute(
+            self._sql("""
+            SELECT s.schema_name
+            FROM ducklake_schema s
+            WHERE ? >= s.begin_snapshot
+              AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
+            ORDER BY s.schema_name
+            """),
+            [snapshot.snapshot_id, snapshot.snapshot_id],
+        ).fetchall()
+        return [r[0] for r in rows]
+
     def list_tables(self, schema_name: str = "main") -> list[str]:
         """List all table names in a schema at the current snapshot."""
         con = self._connect()

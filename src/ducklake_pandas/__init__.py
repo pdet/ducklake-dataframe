@@ -51,6 +51,7 @@ __all__ = [
     "set_ducklake_column_tag",
     "delete_ducklake_table_tag",
     "delete_ducklake_column_tag",
+    "list_schemas",
     "list_tables",
     "list_views",
     "get_view",
@@ -1744,6 +1745,17 @@ def delete_ducklake_column_tag(
         author=author, commit_message=commit_message,
     ) as writer:
         writer.delete_column_tag(table, column, key, schema_name=schema)
+
+
+def list_schemas(
+    path: str | Path,
+    *,
+    data_path: str | Path | None = None,
+) -> list[str]:
+    """List all schema names in a DuckLake catalog."""
+    dp = os.fspath(data_path) if data_path is not None else None
+    with DuckLakeCatalogReader(os.fspath(path), data_path_override=dp) as reader:
+        return reader.list_schemas()
 
 
 def list_tables(
