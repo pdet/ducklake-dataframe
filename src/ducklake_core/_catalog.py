@@ -329,7 +329,7 @@ class DuckLakeCatalogReader:
             FROM ducklake_table t
             JOIN ducklake_schema s ON t.schema_id = s.schema_id
             WHERE LOWER(t.table_name) = LOWER(?)
-              AND s.schema_name = ?
+              AND LOWER(s.schema_name) = LOWER(?)
               AND ? >= t.begin_snapshot
               AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
               AND ? >= s.begin_snapshot
@@ -375,7 +375,7 @@ class DuckLakeCatalogReader:
               AND ? >= c.begin_snapshot
               AND (? < c.end_snapshot OR c.end_snapshot IS NULL)
             WHERE LOWER(t.table_name) = LOWER(?)
-              AND s.schema_name = ?
+              AND LOWER(s.schema_name) = LOWER(?)
               AND ? >= t.begin_snapshot
               AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
               AND ? >= s.begin_snapshot
