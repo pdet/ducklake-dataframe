@@ -380,7 +380,7 @@ class DuckLakeCatalogWriter:
         retry_wait_ms: float = 100,
         retry_backoff: float = 2.0,
     ) -> None:
-        self._backend = create_backend(metadata_path)
+        self._backend = create_backend(metadata_path, data_path=data_path_override)
         self._metadata_path = metadata_path
         self._data_path_override = data_path_override
         self._data_inlining_row_limit = data_inlining_row_limit
