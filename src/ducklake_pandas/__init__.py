@@ -45,6 +45,7 @@ __all__ = [
     "rename_ducklake_table",
     "expire_snapshots",
     "vacuum_ducklake",
+    "rewrite_data_files_ducklake",
     "create_ducklake_view",
     "drop_ducklake_view",
     "set_ducklake_table_tag",
@@ -1843,3 +1844,45 @@ def table_info(
     dp = os.fspath(data_path) if data_path is not None else None
     with DuckLakeCatalogReader(os.fspath(path), data_path_override=dp) as reader:
         return reader.table_info(table, schema)
+
+
+def rewrite_data_files_ducklake(
+    path: str | Path,
+    table: str,
+    *,
+    schema: str = "main",
+    data_path: str | Path | None = None,
+    author: str | None = None,
+    commit_message: str | None = None,
+) -> int:
+    """
+    Rewrite data files for compaction — merge small files, remove deleted rows.
+
+    Parameters
+    ----------
+    path
+        Path to the DuckLake metadata catalog file (.ducklake or .db).
+    table
+        Table name.
+    schema
+        Schema name (default: "main").
+    data_path
+        Override the data path stored in the catalog.
+
+    Returns
+    -------
+    int
+        New snapshot ID, or -1 if no rewrite was needed.
+    """
+    from ducklake_pandas._writer import DuckLakeCatalogWriter
+
+    metadata_path = os.fspath(path)
+    dp = os.fspath(data_path) if data_path is not None else None
+
+    with DuckLakeCatalogWriter(
+        metadata_path,
+        data_path_override=dp,
+        author=author,
+        commit_message=commit_message,
+    ) as writer:
+        return writer.rewrite_data_files(table, schema_name=schema)
