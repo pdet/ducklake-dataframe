@@ -24,12 +24,16 @@ from ducklake_polars import (
 )
 
 
-def _reopen_duckdb(metadata_path, data_path):
+def _reopen_duckdb(metadata_path, data_path, backend="sqlite"):
     con = duckdb.connect()
     con.install_extension("ducklake")
     con.load_extension("ducklake")
+    if backend == "postgres":
+        source = f"ducklake:postgres:{metadata_path}"
+    else:
+        source = f"ducklake:sqlite:{metadata_path}"
     con.execute(
-        f"ATTACH 'ducklake:sqlite:{metadata_path}' AS ducklake "
+        f"ATTACH '{source}' AS ducklake "
         f"(DATA_PATH '{data_path}', DATA_INLINING_ROW_LIMIT 0)"
     )
     return con
@@ -42,6 +46,7 @@ class TestPolarsCompactsDuckDBReads:
         """Multiple appends → compact → DuckDB reads correctly."""
         cat = ducklake_catalog
         meta, data = cat.metadata_path, cat.data_path
+        backend = cat.backend
 
         # Write with DuckDB (creates multiple files)
         cat.execute("CREATE TABLE ducklake.test (id INTEGER, val VARCHAR)")
@@ -68,7 +73,7 @@ class TestPolarsCompactsDuckDBReads:
         assert files_after.shape[0] < files_before.shape[0]
 
         # DuckDB reads the compacted data
-        con = _reopen_duckdb(meta, data)
+        con = _reopen_duckdb(meta, data, getattr(cat, "backend", "sqlite"))
         duckdb_count_after = con.execute("SELECT COUNT(*) FROM ducklake.test").fetchone()[0]
         duckdb_sum = con.execute("SELECT SUM(id) FROM ducklake.test").fetchone()[0]
         con.close()
@@ -84,6 +89,7 @@ class TestPolarsCompactsDuckDBReads:
         """All individual values survive compaction."""
         cat = ducklake_catalog
         meta, data = cat.metadata_path, cat.data_path
+        backend = cat.backend
 
         cat.execute("CREATE TABLE ducklake.test (id INTEGER)")
         for i in range(10):
@@ -98,7 +104,7 @@ class TestPolarsCompactsDuckDBReads:
         rewrite_data_files_ducklake(meta, "test")
 
         # Read back with DuckDB after compaction
-        con = _reopen_duckdb(meta, data)
+        con = _reopen_duckdb(meta, data, getattr(cat, "backend", "sqlite"))
         duckdb_after = sorted(
             r[0] for r in con.execute("SELECT id FROM ducklake.test").fetchall()
         )
@@ -110,6 +116,7 @@ class TestPolarsCompactsDuckDBReads:
         """Compact table that has undergone schema evolution."""
         cat = ducklake_catalog
         meta, data = cat.metadata_path, cat.data_path
+        backend = cat.backend
 
         cat.execute("CREATE TABLE ducklake.test (a INTEGER)")
         cat.execute("INSERT INTO ducklake.test VALUES (1), (2)")
@@ -122,7 +129,7 @@ class TestPolarsCompactsDuckDBReads:
 
         rewrite_data_files_ducklake(meta, "test")
 
-        con = _reopen_duckdb(meta, data)
+        con = _reopen_duckdb(meta, data, getattr(cat, "backend", "sqlite"))
         duckdb_after = con.execute("SELECT * FROM ducklake.test ORDER BY a").fetchall()
         con.close()
 
@@ -132,6 +139,7 @@ class TestPolarsCompactsDuckDBReads:
         """Compact after deletes — dead rows should be garbage collected."""
         cat = ducklake_catalog
         meta, data = cat.metadata_path, cat.data_path
+        backend = cat.backend
 
         cat.execute("CREATE TABLE ducklake.test AS SELECT i AS id FROM range(1000) t(i)")
         cat.execute("DELETE FROM ducklake.test WHERE id % 3 = 0")
@@ -140,7 +148,7 @@ class TestPolarsCompactsDuckDBReads:
 
         rewrite_data_files_ducklake(meta, "test")
 
-        con = _reopen_duckdb(meta, data)
+        con = _reopen_duckdb(meta, data, getattr(cat, "backend", "sqlite"))
         duckdb_after = con.execute("SELECT id FROM ducklake.test ORDER BY id").fetchall()
         con.close()
 
@@ -150,6 +158,7 @@ class TestPolarsCompactsDuckDBReads:
         """Compact after column rename — DuckDB sees renamed columns."""
         cat = ducklake_catalog
         meta, data = cat.metadata_path, cat.data_path
+        backend = cat.backend
 
         cat.execute("CREATE TABLE ducklake.test (a INTEGER, b VARCHAR)")
         cat.execute("INSERT INTO ducklake.test VALUES (1, 'old')")
@@ -161,7 +170,7 @@ class TestPolarsCompactsDuckDBReads:
 
         rewrite_data_files_ducklake(meta, "test")
 
-        con = _reopen_duckdb(meta, data)
+        con = _reopen_duckdb(meta, data, getattr(cat, "backend", "sqlite"))
         cols = [
             d[0] for d in con.execute("SELECT * FROM ducklake.test LIMIT 0").description
         ]
@@ -172,10 +181,11 @@ class TestPolarsCompactsDuckDBReads:
         assert "b" not in cols
         assert duckdb_before == duckdb_after
 
-    def test_compaction_time_travel_still_works(self, ducklake_catalog):
+    def test_compaction_time_travel_still_works(self, ducklake_catalog_sqlite):
         """Time travel to pre-compaction snapshot still returns correct data."""
-        cat = ducklake_catalog
+        cat = ducklake_catalog_sqlite
         meta, data = cat.metadata_path, cat.data_path
+        backend = cat.backend
 
         cat.execute("CREATE TABLE ducklake.test (id INTEGER)")
         cat.execute("INSERT INTO ducklake.test VALUES (1), (2), (3)")
@@ -200,6 +210,7 @@ class TestPolarsCompactsDuckDBReads:
         """DuckDB can continue writing after Polars compacts."""
         cat = ducklake_catalog
         meta, data = cat.metadata_path, cat.data_path
+        backend = cat.backend
 
         cat.execute("CREATE TABLE ducklake.test (id INTEGER)")
         for i in range(5):
@@ -209,7 +220,7 @@ class TestPolarsCompactsDuckDBReads:
         rewrite_data_files_ducklake(meta, "test")
 
         # DuckDB writes more data
-        con = _reopen_duckdb(meta, data)
+        con = _reopen_duckdb(meta, data, getattr(cat, "backend", "sqlite"))
         con.execute("INSERT INTO ducklake.test VALUES (100), (200)")
         count = con.execute("SELECT COUNT(*) FROM ducklake.test").fetchone()[0]
         con.close()
@@ -226,6 +237,7 @@ class TestPolarsCompactsDuckDBReads:
         """Compact a partitioned table — DuckDB reads partitions correctly."""
         cat = ducklake_catalog
         meta, data = cat.metadata_path, cat.data_path
+        backend = cat.backend
 
         cat.execute("CREATE TABLE ducklake.test (val INTEGER, part VARCHAR)")
         cat.execute("ALTER TABLE ducklake.test SET PARTITIONED BY (part)")
@@ -239,7 +251,7 @@ class TestPolarsCompactsDuckDBReads:
 
         rewrite_data_files_ducklake(meta, "test")
 
-        con = _reopen_duckdb(meta, data)
+        con = _reopen_duckdb(meta, data, getattr(cat, "backend", "sqlite"))
         duckdb_after = con.execute("SELECT * FROM ducklake.test ORDER BY val").fetchall()
         # Partition filter
         duckdb_filtered = con.execute(
@@ -257,6 +269,7 @@ class TestPolarsWriteCompactDuckDBReads:
     def test_polars_write_compact_duckdb_read(self, ducklake_catalog):
         cat = ducklake_catalog
         meta, data = cat.metadata_path, cat.data_path
+        backend = cat.backend
         cat.close()  # We only need the initialized catalog
 
         # Polars writes multiple batches
@@ -272,7 +285,7 @@ class TestPolarsWriteCompactDuckDBReads:
         rewrite_data_files_ducklake(meta, "test")
 
         # DuckDB reads
-        con = _reopen_duckdb(meta, data)
+        con = _reopen_duckdb(meta, data, getattr(cat, "backend", "sqlite"))
         count = con.execute("SELECT COUNT(*) FROM ducklake.test").fetchone()[0]
         duckdb_sum = con.execute("SELECT SUM(id) FROM ducklake.test").fetchone()[0]
         con.close()
@@ -287,6 +300,7 @@ class TestPolarsWriteCompactDuckDBReads:
 
         cat = ducklake_catalog
         meta, data = cat.metadata_path, cat.data_path
+        backend = cat.backend
         cat.close()
 
         df1 = pl.DataFrame({"a": [1, 2, 3]})
@@ -299,7 +313,7 @@ class TestPolarsWriteCompactDuckDBReads:
 
         rewrite_data_files_ducklake(meta, "test")
 
-        con = _reopen_duckdb(meta, data)
+        con = _reopen_duckdb(meta, data, getattr(cat, "backend", "sqlite"))
         rows = con.execute("SELECT * FROM ducklake.test ORDER BY a").fetchall()
         con.close()
 
