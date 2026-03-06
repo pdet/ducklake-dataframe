@@ -425,43 +425,26 @@ Test suite: **590+ tests** (5 xfailed for known DuckDB/Polars limitations). Test
 
 ### Benchmarks
 
-Self-tracking performance benchmarks for detecting regressions and measuring optimizations.
+Five benchmark suites for self-tracking regression detection and DuckLake vs [PyIceberg](https://py.iceberg.apache.org/) comparison:
 
-**Read/Write benchmark** — measures write throughput, read throughput, Arrow conversion overhead, and filter pushdown benefit across different row counts:
-
-```bash
-# Default: 1K, 10K, 100K rows, 3 runs each
-python benchmarks/bench_read_write.py
-
-# Custom sizes and runs
-python benchmarks/bench_read_write.py --sizes 1000,10000,100000,1000000 --runs 5
-```
-
-**Streaming benchmark** — simulates a streaming ingestion workload (many small appends) and compares ducklake-dataframe against [PyIceberg](https://py.iceberg.apache.org/), both using Polars as the DataFrame engine:
-
-```bash
-# Default: 100 batches × 1,000 rows
-python benchmarks/bench_streaming.py
-
-# Custom workload
-python benchmarks/bench_streaming.py --batches 200 --batch-size 5000
-
-# Save results to JSON
-python benchmarks/bench_streaming.py --output results.json
-```
-
-The streaming benchmark covers:
-
-| Scenario | Description |
+| Benchmark | What it measures |
 |---|---|
-| Streaming Append | N batches of M rows each |
-| Read-After-Write | Append then immediately read back |
-| Scan + Filter | Predicate pushdown after streaming ingestion |
-| Aggregation | Group-by aggregation over ingested data |
-| Compaction | Merge small files after streaming |
-| Time Travel | Read historical snapshots |
+| [`bench_read_write.py`](benchmarks/bench_read_write.py) | Read/write/filter/agg across Polars, Arrow, and Pandas output formats |
+| [`bench_streaming.py`](benchmarks/bench_streaming.py) | Streaming ingestion: many small appends, read-after-write, compaction |
+| [`bench_schema_evolution.py`](benchmarks/bench_schema_evolution.py) | DDL cost: add/rename/drop columns, read after evolution, wide table projection |
+| [`bench_dml.py`](benchmarks/bench_dml.py) | Delete, update, merge/upsert, delete cascade, read degradation vs compaction |
+| [`bench_catalog.py`](benchmarks/bench_catalog.py) | Metadata ops: cold start, snapshot history, multi-table listing, partition pruning, time travel |
 
-See [`benchmarks/README.md`](benchmarks/README.md) for more details on interpreting results.
+```bash
+# Quick examples
+python benchmarks/bench_read_write.py --rows 100000
+python benchmarks/bench_streaming.py --batches 100 --batch-size 1000
+python benchmarks/bench_schema_evolution.py --evolutions 50 --rows 100000
+python benchmarks/bench_dml.py --rows 100000 --delete-rounds 20
+python benchmarks/bench_catalog.py --snapshots 100 --rows 50000
+```
+
+All comparison benchmarks use the same data and workloads for both systems. See [`benchmarks/README.md`](benchmarks/README.md) for detailed scenario descriptions and interpretation guidance.
 
 ## License
 
