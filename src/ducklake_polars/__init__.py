@@ -48,6 +48,7 @@ __all__ = [
     "expire_snapshots",
     "vacuum_ducklake",
     "rewrite_data_files_ducklake",
+    "DuckLakeStreamWriter",
     "scan_ducklake_changes",
     "read_ducklake_changes",
     "create_ducklake_view",
@@ -1727,3 +1728,131 @@ def read_ducklake_changes(
         path, table, start_version, end_version,
         schema=schema, data_path=data_path,
     ).collect()
+
+
+# ------------------------------------------------------------------
+# Streaming Writer
+# ------------------------------------------------------------------
+
+class DuckLakeStreamWriter:
+    """
+    Buffered streaming writer for micro-batch ingestion.
+
+    Accumulates rows in an internal buffer and flushes to DuckLake
+    when the buffer exceeds ``flush_threshold`` rows. Auto-compacts
+    on close if ``compact_on_close`` is True.
+
+    Parameters
+    ----------
+    path
+        Path to the DuckLake metadata catalog file.
+    table
+        Table name.
+    schema
+        Schema name (default: "main").
+    data_path
+        Override the data path stored in the catalog.
+    flush_threshold
+        Number of rows before auto-flush (default: 10000).
+    compact_on_close
+        Whether to run rewrite_data_files on close (default: True).
+    schema_evolution
+        Schema evolution mode: "strict" or "merge" (default: "strict").
+
+    Examples
+    --------
+    >>> with DuckLakeStreamWriter("catalog.ducklake", "events") as writer:
+    ...     for batch in kafka_consumer:
+    ...         writer.append(batch)  # auto-flushes at threshold
+    ...     # auto-compacts on close
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        table: str,
+        *,
+        schema: str = "main",
+        data_path: str | Path | None = None,
+        flush_threshold: int = 10_000,
+        compact_on_close: bool = True,
+        schema_evolution: str = "strict",
+    ) -> None:
+        import polars as pl
+
+        self._path = os.fspath(path)
+        self._table = table
+        self._schema = schema
+        self._data_path = os.fspath(data_path) if data_path is not None else None
+        self._flush_threshold = flush_threshold
+        self._compact_on_close = compact_on_close
+        self._schema_evolution = schema_evolution
+        self._buffer: list[pl.DataFrame] = []
+        self._buffer_rows = 0
+        self._total_rows = 0
+        self._flush_count = 0
+
+    def __enter__(self) -> DuckLakeStreamWriter:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def append(self, df: pl.DataFrame) -> None:
+        """Append a DataFrame to the buffer. Auto-flushes when threshold is reached."""
+        import polars as pl
+
+        if df.is_empty():
+            return
+        self._buffer.append(df)
+        self._buffer_rows += len(df)
+        if self._buffer_rows >= self._flush_threshold:
+            self.flush()
+
+    def flush(self) -> None:
+        """Write buffered data to DuckLake."""
+        import polars as pl
+
+        if not self._buffer:
+            return
+
+        combined = pl.concat(self._buffer) if len(self._buffer) > 1 else self._buffer[0]
+        write_ducklake(
+            combined,
+            self._path,
+            self._table,
+            schema=self._schema,
+            mode="append",
+            data_path=self._data_path,
+            schema_evolution=self._schema_evolution,
+        )
+        self._total_rows += len(combined)
+        self._flush_count += 1
+        self._buffer.clear()
+        self._buffer_rows = 0
+
+    def close(self) -> None:
+        """Flush remaining buffer and optionally compact."""
+        self.flush()
+        if self._compact_on_close and self._flush_count > 1:
+            rewrite_data_files_ducklake(
+                self._path,
+                self._table,
+                schema=self._schema,
+                data_path=self._data_path,
+            )
+
+    @property
+    def total_rows(self) -> int:
+        """Total rows written (flushed + buffered)."""
+        return self._total_rows + self._buffer_rows
+
+    @property
+    def flush_count(self) -> int:
+        """Number of flushes performed."""
+        return self._flush_count
+
+    @property
+    def buffer_rows(self) -> int:
+        """Current number of buffered rows."""
+        return self._buffer_rows
