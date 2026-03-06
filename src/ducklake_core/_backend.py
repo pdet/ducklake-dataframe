@@ -14,6 +14,7 @@ class SQLiteBackend:
 
     path: str
     placeholder: str = "?"
+    _data_path: str | None = None
 
     def connect(self) -> sqlite3.Connection:
         """Open a read-only SQLite connection."""
@@ -23,10 +24,17 @@ class SQLiteBackend:
     def connect_writable(self) -> sqlite3.Connection:
         """Open a read-write SQLite connection.
 
+        If the catalog file does not exist, is empty, or lacks the
+        required DuckLake tables, it is automatically bootstrapped
+        before the connection is returned.
+
         Uses manual transaction mode (isolation_level=None) so we can
         issue explicit ``BEGIN IMMEDIATE`` before write operations to
         acquire the write lock and prevent concurrent ID races.
         """
+        from ducklake_core._bootstrap import bootstrap_catalog
+
+        bootstrap_catalog(self.path, data_path=self._data_path)
         abs_path = os.path.abspath(self.path)
         con = sqlite3.connect(abs_path, timeout=30)
         con.isolation_level = None  # Manual transaction management
@@ -247,13 +255,22 @@ class DuckDBBackend:
         return row is not None and row[0] > 0
 
 
-def create_backend(path: str) -> SQLiteBackend | PostgreSQLBackend | DuckDBBackend:
+def create_backend(
+    path: str, *, data_path: str | None = None,
+) -> SQLiteBackend | PostgreSQLBackend | DuckDBBackend:
     """
     Auto-detect the backend type from the connection string.
 
     PostgreSQL is detected when the path starts with ``postgresql://``,
     ``postgres://``, or contains ``host=`` or ``dbname=`` (libpq key-value
     format).  Everything else is treated as a SQLite file path.
+
+    Parameters
+    ----------
+    data_path
+        Optional data directory path.  Passed to ``SQLiteBackend`` so it
+        can bootstrap a fresh catalog with the correct ``data_path``
+        metadata entry.
     """
     lower = path.strip().lower()
     if (
@@ -268,4 +285,4 @@ def create_backend(path: str) -> SQLiteBackend | PostgreSQLBackend | DuckDBBacke
         if clean.lower().startswith("duckdb:"):
             clean = clean[7:]
         return DuckDBBackend(path=clean)
-    return SQLiteBackend(path=path)
+    return SQLiteBackend(path=path, _data_path=data_path)

@@ -1,0 +1,309 @@
+"""Bootstrap an empty DuckLake catalog with the required schema tables."""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------
+# DDL for the 22 DuckLake catalog tables (matches DuckDB v0.3 catalog layout)
+# ---------------------------------------------------------------------------
+
+_CATALOG_DDL: list[str] = [
+    """CREATE TABLE ducklake_metadata(
+        "key" VARCHAR NOT NULL,
+        "value" VARCHAR NOT NULL,
+        "scope" VARCHAR,
+        scope_id BIGINT
+    )""",
+    """CREATE TABLE ducklake_snapshot(
+        snapshot_id BIGINT PRIMARY KEY,
+        snapshot_time VARCHAR,
+        schema_version BIGINT,
+        next_catalog_id BIGINT,
+        next_file_id BIGINT
+    )""",
+    """CREATE TABLE ducklake_snapshot_changes(
+        snapshot_id BIGINT PRIMARY KEY,
+        changes_made VARCHAR,
+        author VARCHAR,
+        commit_message VARCHAR,
+        commit_extra_info VARCHAR
+    )""",
+    """CREATE TABLE ducklake_schema(
+        schema_id BIGINT PRIMARY KEY,
+        schema_uuid VARCHAR,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        schema_name VARCHAR,
+        path VARCHAR,
+        path_is_relative BIGINT
+    )""",
+    """CREATE TABLE ducklake_schema_versions(
+        begin_snapshot BIGINT,
+        schema_version BIGINT
+    )""",
+    """CREATE TABLE ducklake_table(
+        table_id BIGINT,
+        table_uuid VARCHAR,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        schema_id BIGINT,
+        table_name VARCHAR,
+        path VARCHAR,
+        path_is_relative BIGINT
+    )""",
+    """CREATE TABLE ducklake_column(
+        column_id BIGINT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        table_id BIGINT,
+        column_order BIGINT,
+        column_name VARCHAR,
+        column_type VARCHAR,
+        initial_default VARCHAR,
+        default_value VARCHAR,
+        nulls_allowed BIGINT,
+        parent_column BIGINT
+    )""",
+    """CREATE TABLE ducklake_data_file(
+        data_file_id BIGINT PRIMARY KEY,
+        table_id BIGINT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        file_order BIGINT,
+        path VARCHAR,
+        path_is_relative BIGINT,
+        file_format VARCHAR,
+        record_count BIGINT,
+        file_size_bytes BIGINT,
+        footer_size BIGINT,
+        row_id_start BIGINT,
+        partition_id BIGINT,
+        encryption_key VARCHAR,
+        partial_file_info VARCHAR,
+        mapping_id BIGINT
+    )""",
+    """CREATE TABLE ducklake_delete_file(
+        delete_file_id BIGINT PRIMARY KEY,
+        table_id BIGINT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        data_file_id BIGINT,
+        path VARCHAR,
+        path_is_relative BIGINT,
+        format VARCHAR,
+        delete_count BIGINT,
+        file_size_bytes BIGINT,
+        footer_size BIGINT,
+        encryption_key VARCHAR
+    )""",
+    """CREATE TABLE ducklake_file_column_stats(
+        data_file_id BIGINT,
+        table_id BIGINT,
+        column_id BIGINT,
+        column_size_bytes BIGINT,
+        value_count BIGINT,
+        null_count BIGINT,
+        min_value VARCHAR,
+        max_value VARCHAR,
+        contains_nan BIGINT,
+        extra_stats VARCHAR
+    )""",
+    """CREATE TABLE ducklake_file_partition_value(
+        data_file_id BIGINT,
+        table_id BIGINT,
+        partition_key_index BIGINT,
+        partition_value VARCHAR
+    )""",
+    """CREATE TABLE ducklake_files_scheduled_for_deletion(
+        data_file_id BIGINT,
+        path VARCHAR,
+        path_is_relative BIGINT,
+        schedule_start VARCHAR
+    )""",
+    """CREATE TABLE ducklake_inlined_data_tables(
+        table_id BIGINT,
+        table_name VARCHAR,
+        schema_version BIGINT
+    )""",
+    """CREATE TABLE ducklake_column_mapping(
+        mapping_id BIGINT,
+        table_id BIGINT,
+        "type" VARCHAR
+    )""",
+    """CREATE TABLE ducklake_name_mapping(
+        mapping_id BIGINT,
+        column_id BIGINT,
+        source_name VARCHAR,
+        target_field_id BIGINT,
+        parent_column BIGINT,
+        is_partition BIGINT
+    )""",
+    """CREATE TABLE ducklake_partition_column(
+        partition_id BIGINT,
+        table_id BIGINT,
+        partition_key_index BIGINT,
+        column_id BIGINT,
+        "transform" VARCHAR
+    )""",
+    """CREATE TABLE ducklake_partition_info(
+        partition_id BIGINT,
+        table_id BIGINT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT
+    )""",
+    """CREATE TABLE ducklake_table_stats(
+        table_id BIGINT,
+        record_count BIGINT,
+        next_row_id BIGINT,
+        file_size_bytes BIGINT
+    )""",
+    """CREATE TABLE ducklake_table_column_stats(
+        table_id BIGINT,
+        column_id BIGINT,
+        contains_null BIGINT,
+        contains_nan BIGINT,
+        min_value VARCHAR,
+        max_value VARCHAR,
+        extra_stats VARCHAR
+    )""",
+    """CREATE TABLE ducklake_tag(
+        object_id BIGINT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        "key" VARCHAR,
+        "value" VARCHAR
+    )""",
+    """CREATE TABLE ducklake_column_tag(
+        table_id BIGINT,
+        column_id BIGINT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        "key" VARCHAR,
+        "value" VARCHAR
+    )""",
+    """CREATE TABLE ducklake_view(
+        view_id BIGINT,
+        view_uuid VARCHAR,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        schema_id BIGINT,
+        view_name VARCHAR,
+        dialect VARCHAR,
+        "sql" VARCHAR,
+        column_aliases VARCHAR
+    )""",
+]
+
+
+def _needs_bootstrap(path: str) -> bool:
+    """Return True if the SQLite file needs catalog bootstrapping.
+
+    A catalog needs bootstrapping when the file does not exist, is empty
+    (0 bytes), or exists but doesn't contain the ``ducklake_metadata``
+    table.
+    """
+    abs_path = os.path.abspath(path)
+    if not os.path.exists(abs_path):
+        return True
+    if os.path.getsize(abs_path) == 0:
+        return True
+    # File exists and has content — check for the marker table.
+    try:
+        con = sqlite3.connect(f"file:{abs_path}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name='ducklake_metadata'"
+            ).fetchone()
+            return row is None or row[0] == 0
+        finally:
+            con.close()
+    except sqlite3.OperationalError:
+        return True
+
+
+def bootstrap_catalog(path: str, *, data_path: str | None = None) -> None:
+    """Create all DuckLake catalog tables and seed initial data.
+
+    Parameters
+    ----------
+    path
+        Path to the SQLite catalog file (``.ducklake``).
+    data_path
+        Storage path for Parquet data files.  If *None*, defaults to a
+        ``data/`` directory next to the catalog file.
+
+    This is idempotent — calling it on an already-bootstrapped catalog
+    is a no-op.
+    """
+    if not _needs_bootstrap(path):
+        return
+
+    abs_path = os.path.abspath(path)
+
+    # Ensure parent directory exists
+    parent_dir = os.path.dirname(abs_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+    # Resolve data_path
+    if data_path is None:
+        data_path = os.path.join(parent_dir, "data") if parent_dir else "data"
+    data_path = os.path.abspath(data_path)
+
+    # Ensure data_path ends with / to match DuckDB convention
+    if not data_path.endswith("/"):
+        data_path = data_path + "/"
+
+    # Ensure data directory exists
+    os.makedirs(data_path, exist_ok=True)
+
+    con = sqlite3.connect(abs_path)
+    try:
+        # Create all 22 catalog tables
+        for ddl in _CATALOG_DDL:
+            con.execute(ddl)
+
+        # Seed metadata
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f+00")
+        schema_uuid = str(uuid.uuid4())
+
+        con.execute(
+            "INSERT INTO ducklake_metadata VALUES (?, ?, NULL, NULL)",
+            ("version", "0.3"),
+        )
+        con.execute(
+            "INSERT INTO ducklake_metadata VALUES (?, ?, NULL, NULL)",
+            ("created_by", "ducklake-dataframe"),
+        )
+        con.execute(
+            "INSERT INTO ducklake_metadata VALUES (?, ?, NULL, NULL)",
+            ("encrypted", "false"),
+        )
+        con.execute(
+            "INSERT INTO ducklake_metadata VALUES (?, ?, NULL, NULL)",
+            ("data_path", data_path),
+        )
+        con.execute(
+            "INSERT INTO ducklake_snapshot VALUES (?, ?, ?, ?, ?)",
+            (0, now, 0, 1, 0),
+        )
+        con.execute(
+            "INSERT INTO ducklake_schema VALUES (?, ?, ?, NULL, ?, ?, ?)",
+            (0, schema_uuid, 0, "main", "main/", 1),
+        )
+        con.execute(
+            "INSERT INTO ducklake_schema_versions VALUES (?, ?)",
+            (0, 0),
+        )
+
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
