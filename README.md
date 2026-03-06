@@ -423,6 +423,46 @@ DUCKLAKE_PG_DSN="postgresql://user:pass@localhost/testdb" pytest
 
 Test suite: **590+ tests** (5 xfailed for known DuckDB/Polars limitations). Tests are parametrized over backends — SQLite always runs; PostgreSQL runs when `DUCKLAKE_PG_DSN` is set. Both wrappers are tested for interoperability with DuckDB's native extension.
 
+### Benchmarks
+
+Self-tracking performance benchmarks for detecting regressions and measuring optimizations.
+
+**Read/Write benchmark** — measures write throughput, read throughput, Arrow conversion overhead, and filter pushdown benefit across different row counts:
+
+```bash
+# Default: 1K, 10K, 100K rows, 3 runs each
+python benchmarks/bench_read_write.py
+
+# Custom sizes and runs
+python benchmarks/bench_read_write.py --sizes 1000,10000,100000,1000000 --runs 5
+```
+
+**Streaming benchmark** — simulates a streaming ingestion workload (many small appends) and compares ducklake-dataframe against [PyIceberg](https://py.iceberg.apache.org/), both using Polars as the DataFrame engine:
+
+```bash
+# Default: 100 batches × 1,000 rows
+python benchmarks/bench_streaming.py
+
+# Custom workload
+python benchmarks/bench_streaming.py --batches 200 --batch-size 5000
+
+# Save results to JSON
+python benchmarks/bench_streaming.py --output results.json
+```
+
+The streaming benchmark covers:
+
+| Scenario | Description |
+|---|---|
+| Streaming Append | N batches of M rows each |
+| Read-After-Write | Append then immediately read back |
+| Scan + Filter | Predicate pushdown after streaming ingestion |
+| Aggregation | Group-by aggregation over ingested data |
+| Compaction | Merge small files after streaming |
+| Time Travel | Read historical snapshots |
+
+See [`benchmarks/README.md`](benchmarks/README.md) for more details on interpreting results.
+
 ## License
 
 MIT
