@@ -20,3 +20,12 @@ class SchemaNotFoundError(DuckLakeError, ValueError):
 
 class CatalogVersionError(DuckLakeError, ValueError):
     """Raised when the catalog version is unsupported or missing."""
+
+
+class UnsupportedUnionTypeError(DuckLakeError, TypeError):
+    """Raised when a UNION-typed column is written without conversion.
+
+    DuckLake does not natively support UNION types (upstream limitation).
+    Use ``union_handling="to_struct"`` to automatically convert UNION
+    columns to STRUCT before writing, or restructure the data manually.
+    """

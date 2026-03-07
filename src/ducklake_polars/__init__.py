@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from ducklake_core._catalog import DuckLakeCatalogReader
 from ducklake_core._writer import TransactionConflictError
+from ducklake_core._exceptions import UnsupportedUnionTypeError
 from ducklake_polars._catalog_api import DuckLakeCatalog
 
 __all__ = [
@@ -66,6 +67,7 @@ __all__ = [
     "snapshot_changes",
     "catalog_info",
     "DuckLakeCatalog",
+    "UnsupportedUnionTypeError",
 ]
 
 
@@ -221,6 +223,7 @@ def write_ducklake(
     retry_wait_ms: float = 100,
     retry_backoff: float = 2.0,
     schema_evolution: str = "strict",
+    union_handling: str = "error",
 ) -> None:
     """
     Write a Polars DataFrame to a DuckLake table.
@@ -257,17 +260,45 @@ def write_ducklake(
         inlining. When enabled, small inserts below this threshold are
         stored directly in the catalog database.
 
+    union_handling
+        How to handle UNION-typed columns (from Arrow data):
+        - ``"error"`` (default): Raise ``UnsupportedUnionTypeError`` if
+          any column has a UNION type.
+        - ``"to_struct"``: Automatically convert UNION columns to STRUCT
+          before writing. Each struct has one field per union member;
+          the active member's field is set and others are NULL.
+
     Raises
     ------
     ValueError
         If mode is ``"error"`` and the table already exists, or if the
         mode is not recognized.
+    UnsupportedUnionTypeError
+        If ``union_handling="error"`` and a UNION-typed column is detected.
     """
+    if union_handling not in ("error", "to_struct"):
+        msg = f"Invalid union_handling '{union_handling}'. Must be 'error' or 'to_struct'."
+        raise ValueError(msg)
+
     if mode not in ("error", "append", "overwrite"):
         msg = f"Invalid write mode '{mode}'. Must be 'error', 'append', or 'overwrite'."
         raise ValueError(msg)
 
+    from ducklake_core._union import (
+        check_no_union_types,
+        convert_unions_in_table,
+        has_union_type,
+    )
     from ducklake_polars._writer import DuckLakeCatalogWriter
+
+    # Handle UNION types in the DataFrame (Arrow level)
+    arrow_table = df.to_arrow()
+    if has_union_type(arrow_table.schema):
+        if union_handling == "error":
+            check_no_union_types(arrow_table, context=table)
+        else:  # to_struct
+            arrow_table = convert_unions_in_table(arrow_table)
+            df = pl.from_arrow(arrow_table)
 
     metadata_path = os.fspath(path)
     dp = os.fspath(data_path) if data_path is not None else None
@@ -558,6 +589,7 @@ def create_table_as_ducklake(
     data_inlining_row_limit: int = 0,
     author: str | None = None,
     commit_message: str | None = None,
+    union_handling: str = "error",
 ) -> None:
     """
     Create a new table and insert data in a single snapshot.
@@ -587,7 +619,21 @@ def create_table_as_ducklake(
     ValueError
         If the table already exists.
     """
+    from ducklake_core._union import (
+        check_no_union_types,
+        convert_unions_in_table,
+        has_union_type,
+    )
     from ducklake_polars._writer import DuckLakeCatalogWriter
+
+    # Handle UNION types
+    arrow_table = df.to_arrow()
+    if has_union_type(arrow_table.schema):
+        if union_handling == "error":
+            check_no_union_types(arrow_table, context=table)
+        else:  # to_struct
+            arrow_table = convert_unions_in_table(arrow_table)
+            df = pl.from_arrow(arrow_table)
 
     metadata_path = os.fspath(path)
     dp = os.fspath(data_path) if data_path is not None else None

@@ -196,6 +196,16 @@ def arrow_type_to_duckdb(dtype: pa.DataType) -> str:
     if pa.types.is_fixed_size_binary(dtype):
         return "blob"
 
+    # UNION types — not supported by DuckLake upstream
+    if pa.types.is_union(dtype):
+        from ducklake_core._exceptions import UnsupportedUnionTypeError
+        raise UnsupportedUnionTypeError(
+            f"Arrow UNION type ({dtype}) cannot be mapped to a DuckDB type. "
+            f"DuckLake does not support UNION types (upstream limitation). "
+            f"Use union_handling='to_struct' to convert UNION columns to "
+            f"STRUCT before writing."
+        )
+
     msg = f"Cannot map Arrow type {dtype} to DuckDB type"
     raise ValueError(msg)
 
