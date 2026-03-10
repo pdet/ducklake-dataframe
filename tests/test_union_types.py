@@ -1,4 +1,4 @@
-"""Tests for UNION type handling in ducklake-polars.
+"""Tests for UNION type handling in ducklake-dataframe.
 
 DuckLake upstream does not support UNION types natively. These tests
 verify that:

@@ -1,4 +1,4 @@
-"""Comprehensive type coverage tests for ducklake-polars.
+"""Comprehensive type coverage tests for ducklake-dataframe.
 
 Tests round-trip (DuckDB write → ducklake_polars read) for every DuckDB type,
 including NULL handling.  Uses the SQLite backend for speed and zero setup.

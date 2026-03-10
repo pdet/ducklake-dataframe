@@ -417,7 +417,7 @@ class TestFieldIdDuckDBInterop:
         cat.close()
 
     def test_polars_writer_field_id_duckdb_readable(self, tmp_path):
-        """Files written by ducklake-polars with field_id are DuckDB-readable."""
+        """Files written by ducklake-dataframe with field_id are DuckDB-readable."""
         import duckdb
 
         metadata_path = str(tmp_path / "test.ducklake")

@@ -73,7 +73,7 @@ def _stamp_field_ids(
     (top-level only).  For every column in the table whose name matches a
     catalog column, the corresponding ``column_id`` is stored as
     ``PARQUET:field_id`` in the Arrow field metadata so that Parquet
-    readers (DuckDB, ducklake-polars) can identify columns by stable ID
+    readers (DuckDB, ducklake-dataframe) can identify columns by stable ID
     rather than by name or position.
     """
     col_name_to_id: dict[str, int] = {name: col_id for col_id, name, _, _ in columns}

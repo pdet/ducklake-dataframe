@@ -477,7 +477,7 @@ Key differences from the Polars wrapper:
 - Includes `add_files_ducklake` for registering existing Parquet files
 - Includes `rewrite_data_files_ducklake` for compaction
 
-See the [PySpark wiki page](https://github.com/pdet/ducklake-polars/wiki/PySpark) for complete API documentation and examples.
+See the [PySpark wiki page](https://github.com/pdet/ducklake-dataframe/wiki/PySpark) for complete API documentation and examples.
 
 ## Known limitations
 
