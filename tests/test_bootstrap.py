@@ -157,6 +157,13 @@ class TestBootstrapCatalog:
 class TestDuckDBInterop:
     """Test that a bootstrapped catalog is readable by DuckDB."""
 
+    @pytest.fixture(autouse=True)
+    def _require_duckdb_v1_5(self):
+        """Skip if DuckDB < 1.5.0 (no v0.4 catalog support)."""
+        parts = duckdb.__version__.split(".")
+        if len(parts) >= 2 and (int(parts[0]), int(parts[1])) < (1, 5):
+            pytest.skip(f"DuckDB {duckdb.__version__} does not support v0.4 catalogs")
+
     def test_duckdb_can_attach(self, tmp_path):
         path = str(tmp_path / "test.ducklake")
         data_path = str(tmp_path / "data")

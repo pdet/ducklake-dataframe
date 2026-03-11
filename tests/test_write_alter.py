@@ -833,6 +833,11 @@ class TestSortKeys:
         alter_ducklake_reset_sort_keys(cat.metadata_path, "test")
 
     def test_sort_keys_duckdb_roundtrip(self, make_write_catalog):
+        import duckdb as _duckdb
+        parts = _duckdb.__version__.split(".")
+        if len(parts) >= 2 and (int(parts[0]), int(parts[1])) < (1, 5):
+            pytest.skip(f"DuckDB {_duckdb.__version__} does not support v0.4 catalogs")
+
         """Sort keys set by us are read correctly by DuckDB and vice versa."""
         import duckdb
 
