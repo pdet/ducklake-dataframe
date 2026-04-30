@@ -9,7 +9,10 @@ import shutil
 import duckdb
 import pytest
 
-pyspark = pytest.importorskip("pyspark")
+if os.environ.get("REQUIRE_PYSPARK") == "1":
+    import pyspark  # noqa: F401
+else:
+    pyspark = pytest.importorskip("pyspark")
 
 from pyspark.sql import SparkSession
 from pyspark.sql.types import IntegerType, StringType, LongType

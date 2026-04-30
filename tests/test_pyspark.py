@@ -11,8 +11,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-# Skip all tests if PySpark is not available
-pyspark = pytest.importorskip("pyspark")
+# If REQUIRE_PYSPARK=1, a missing PySpark is a hard failure (used in CI on
+# Python >= 3.10). Otherwise, silently skip — useful for environments where
+# PySpark / a JVM is not available.
+if os.environ.get("REQUIRE_PYSPARK") == "1":
+    import pyspark  # noqa: F401  (fail loudly if missing)
+else:
+    pyspark = pytest.importorskip("pyspark")
 
 from pyspark.sql import SparkSession
 from pyspark.sql.types import (

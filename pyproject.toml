@@ -39,6 +39,7 @@ Issues = "https://github.com/pdet/ducklake-dataframe/issues"
 [project.optional-dependencies]
 polars = ["polars>=1.0"]
 pandas = ["pandas>=1.5"]
+pyspark = ['pyspark>=3.4; python_version >= "3.10"']
 duckdb = ["duckdb>=1.2"]
 postgres = ["psycopg2-binary>=2.9"]
 cloud = ["fsspec>=2023.1"]
@@ -48,6 +49,7 @@ azure = ["fsspec>=2023.1", "adlfs"]
 all = [
     "polars>=1.0",
     "pandas>=1.5",
+    'pyspark>=3.4; python_version >= "3.10"',
     "duckdb>=1.2",
     "psycopg2-binary>=2.9",
     "fsspec>=2023.1",
@@ -62,12 +64,18 @@ dev = [
     "duckdb>=1.2",
     "polars>=1.0",
     "pandas>=1.5",
+    'pyspark>=3.4; python_version >= "3.10"',
     "hypothesis>=6.0",
     "pytz",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ducklake_core", "src/ducklake_polars", "src/ducklake_pandas"]
+packages = [
+    "src/ducklake_core",
+    "src/ducklake_polars",
+    "src/ducklake_pandas",
+    "src/ducklake_pyspark",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "tests_pandas"]

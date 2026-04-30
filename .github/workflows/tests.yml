@@ -40,10 +40,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      - name: Set up JDK 17 (PySpark runtime)
+        if: matrix.python-version != '3.9'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - name: Install dependencies
         run: pip install -e ".[dev,postgres]"
 
       - name: Run tests (SQLite + PostgreSQL)
         env:
           DUCKLAKE_PG_DSN: "postgresql://ducklake:ducklake@localhost:5432/ducklake_test"
+          # On Python >= 3.10, PySpark is installed via the dev extra and we
+          # require its tests to actually run (not silently skip).
+          REQUIRE_PYSPARK: ${{ matrix.python-version != '3.9' && '1' || '0' }}
         run: pytest --timeout=300 -q
