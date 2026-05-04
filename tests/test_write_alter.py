@@ -833,8 +833,6 @@ class TestSortKeys:
         import duckdb
 
         cat = make_write_catalog()
-        if "postgres" in cat.metadata_path:
-            pytest.skip("DuckDB interop only for SQLite")
 
         df = pl.DataFrame({"a": [3, 1, 2], "b": ["c", "a", "b"]})
         write_ducklake(df, cat.metadata_path, "test", mode="error")
@@ -849,7 +847,7 @@ class TestSortKeys:
         con.install_extension("ducklake")
         con.load_extension("ducklake")
         con.execute(
-            f"ATTACH 'ducklake:sqlite:{cat.metadata_path}' AS ducklake "
+            f"ATTACH '{cat.attach_source()}' AS ducklake "
             f"(DATA_PATH '{cat.data_path}')"
         )
 

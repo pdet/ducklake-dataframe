@@ -1085,17 +1085,27 @@ from ducklake_pyspark import delete_ducklake
 delete_ducklake(
     path: str | Path,
     table: str,
-    predicate: str,
+    predicate_sql: str,
     *,
     schema: str = "main",
     ...
 ) -> int
 ```
 
-`predicate` is a SQL string evaluated against table columns:
+`predicate_sql` is a SQL expression evaluated against table columns:
 
 ```python
 deleted = delete_ducklake("catalog.ducklake", "users", "id > 10")
+```
+
+`update_ducklake` similarly takes `predicate_sql=` rather than `predicate=`:
+
+```python
+update_ducklake(
+    "catalog.ducklake", "users",
+    updates={"region": "APAC"},
+    predicate_sql="name = 'Eve'",
+)
 ```
 
 ### `create_ducklake_table` (PySpark)
